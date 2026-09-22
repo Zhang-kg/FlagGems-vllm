@@ -3653,7 +3653,10 @@ def main() -> int:
         print("TIMEOUT\nstdout:", (exc.stdout or "")[-2500:])
         print("stderr:", (exc.stderr or "")[-2500:])
         return 1
-    print(proc.stdout[-5000:])
+    # Forward the workers' output whole: every rank's result line has to
+    # reach whatever is reading this launcher, and a tail cuts off the
+    # low-numbered ranks as soon as anything else writes to stdout.
+    print(proc.stdout, end="")
     if proc.returncode != 0:
         print("STDERR:", proc.stderr[-4000:])
     return proc.returncode
