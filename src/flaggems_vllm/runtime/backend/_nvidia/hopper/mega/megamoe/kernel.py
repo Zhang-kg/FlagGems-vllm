@@ -2300,6 +2300,98 @@ def dispatch_frontend_dual_pull(
 
 
 @triton.jit
+def dispatch_raw_tail(
+    rsum_tab,
+    recv_tab,
+    q_tab,
+    meta_tab,
+    sf_tab,
+    w_tab,
+    l1_arrival_count,
+    l1_token,
+    l1_sf,
+    l1_w,
+    d8_token0_s,
+    d8_state0_s,
+    d8_token1_s,
+    d8_state1_s,
+    tp0,
+    tp1,
+    tp2,
+    tp3,
+    tp4,
+    tp5,
+    tp6,
+    tp7,
+    MY_PE: tl.constexpr,
+    NPES: tl.constexpr,
+    NUM_SMS: tl.constexpr,
+    EPR: tl.constexpr,
+    MAX_RECV: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    K: tl.constexpr,
+    NSF: tl.constexpr,
+    POOL_TOKENS: tl.constexpr,
+    TOPK: tl.constexpr,
+):
+    # Keep the raw ABI tail separate so the dispatch frontend can inline into
+    # its warp-specialized partition and receive the correct named barrier ID.
+    rsum_l = peer_i64(rsum_tab, MY_PE)
+    recv_l = peer_i64(recv_tab, MY_PE)
+    queue_l = peer_i32(q_tab, MY_PE)
+    metadata_l = peer_i32(meta_tab, MY_PE)
+    stage0 = smem_generic_addr(tle.gpu.local_ptr(d8_token0_s, (0,)))
+    state0 = smem_generic_addr(tle.gpu.local_ptr(d8_state0_s, (0,)))
+    stage1 = smem_generic_addr(tle.gpu.local_ptr(d8_token1_s, (0,)))
+    state1 = smem_generic_addr(tle.gpu.local_ptr(d8_state1_s, (0,)))
+    npes_v = tl.full((), NPES, tl.int32)
+    num_sms_v = tl.full((), NUM_SMS, tl.int32)
+    epr_v = tl.full((), EPR, tl.int32)
+    max_recv_v = tl.full((), MAX_RECV, tl.int32)
+    block_m_v = tl.full((), BLOCK_M, tl.int32)
+    k_v = tl.full((), K, tl.int32)
+    nsf_v = tl.full((), NSF, tl.int32)
+    pool_tokens_v = tl.full((), POOL_TOKENS, tl.int32)
+    topk_v = tl.full((), TOPK, tl.int32)
+    tle_raw.call(
+        d8_unified_dispatch_edsl,
+        [
+            tl.cast(rsum_l, tl.int64),
+            tl.cast(recv_l, tl.int64),
+            tl.cast(queue_l, tl.int64),
+            tl.cast(metadata_l, tl.int64),
+            tl.cast(sf_tab, tl.int64),
+            tl.cast(w_tab, tl.int64),
+            tl.cast(l1_arrival_count, tl.int64),
+            tl.cast(l1_token, tl.int64),
+            tl.cast(l1_sf, tl.int64),
+            tl.cast(l1_w, tl.int64),
+            stage0,
+            state0,
+            stage1,
+            state1,
+            tp0,
+            tp1,
+            tp2,
+            tp3,
+            tp4,
+            tp5,
+            tp6,
+            tp7,
+            npes_v,
+            num_sms_v,
+            epr_v,
+            max_recv_v,
+            block_m_v,
+            k_v,
+            nsf_v,
+            pool_tokens_v,
+            topk_v,
+        ],
+    )
+
+
+@triton.jit
 def dispatch_role_dual_pull(
     topk_local,
     sf_tab,
@@ -2375,64 +2467,41 @@ def dispatch_role_dual_pull(
         FAST_NVLINK_BARRIER,
     )
 
-    # D6-D9: the same two physical warps split into independent streams.
-    # Pass integer-encoded addresses across the raw ABI; no addrspace pointer
-    # is exposed to Triton's extern linker.
-    # 获取本rank的数据
-    rsum_l = peer_i64(rsum_tab, MY_PE)
-    recv_l = peer_i64(recv_tab, MY_PE)
-    queue_l = peer_i32(q_tab, MY_PE)
-    metadata_l = peer_i32(meta_tab, MY_PE)
-    # stage0/1 两个stream格子的FP8 token SMEM缓冲区；state0/1 各自的TMA mbarrier状态
-    stage0 = smem_generic_addr(tle.gpu.local_ptr(d8_token0_s, (0,)))
-    state0 = smem_generic_addr(tle.gpu.local_ptr(d8_state0_s, (0,)))
-    stage1 = smem_generic_addr(tle.gpu.local_ptr(d8_token1_s, (0,)))
-    state1 = smem_generic_addr(tle.gpu.local_ptr(d8_state1_s, (0,)))
-    # Raw extern operands must be SSA values, not Python-side constexprs.
-    npes_v = tl.full((), NPES, tl.int32)
-    num_sms_v = tl.full((), NUM_SMS, tl.int32)
-    epr_v = tl.full((), EPR, tl.int32)
-    max_recv_v = tl.full((), MAX_RECV, tl.int32)
-    block_m_v = tl.full((), BLOCK_M, tl.int32)
-    k_v = tl.full((), K, tl.int32)
-    nsf_v = tl.full((), NSF, tl.int32)
-    pool_tokens_v = tl.full((), POOL_TOKENS, tl.int32)
-    topk_v = tl.full((), TOPK, tl.int32)
-    tle_raw.call(
-        d8_unified_dispatch_edsl,
-        [
-            tl.cast(rsum_l, tl.int64),
-            tl.cast(recv_l, tl.int64),
-            tl.cast(queue_l, tl.int64),
-            tl.cast(metadata_l, tl.int64),
-            tl.cast(sf_tab, tl.int64),
-            tl.cast(w_tab, tl.int64),
-            tl.cast(l1_arrival_count, tl.int64),
-            tl.cast(l1_token, tl.int64),
-            tl.cast(l1_sf, tl.int64),
-            tl.cast(l1_w, tl.int64),
-            stage0,
-            state0,
-            stage1,
-            state1,
-            tp0,
-            tp1,
-            tp2,
-            tp3,
-            tp4,
-            tp5,
-            tp6,
-            tp7,
-            npes_v,
-            num_sms_v,
-            epr_v,
-            max_recv_v,
-            block_m_v,
-            k_v,
-            nsf_v,
-            pool_tokens_v,
-            topk_v,
-        ],
+    # D6-D9: keep the raw ABI tail in a separate helper.  This wrapper then
+    # contains the frontend barriers in the warp-specialized partition.
+    dispatch_raw_tail(
+        rsum_tab,
+        recv_tab,
+        q_tab,
+        meta_tab,
+        sf_tab,
+        w_tab,
+        l1_arrival_count,
+        l1_token,
+        l1_sf,
+        l1_w,
+        d8_token0_s,
+        d8_state0_s,
+        d8_token1_s,
+        d8_state1_s,
+        tp0,
+        tp1,
+        tp2,
+        tp3,
+        tp4,
+        tp5,
+        tp6,
+        tp7,
+        MY_PE,
+        NPES,
+        NUM_SMS,
+        EPR,
+        MAX_RECV,
+        BLOCK_M,
+        K,
+        NSF,
+        POOL_TOKENS,
+        TOPK,
     )
 
 
