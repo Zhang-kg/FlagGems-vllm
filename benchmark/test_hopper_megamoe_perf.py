@@ -231,7 +231,7 @@ def _dataset_tokens_per_rank(manifest):
         if shape.get(key) != value
     }
     if mismatch:
-        pytest.skip(f"dataset does not describe the benchmarked shape: {mismatch}")
+        pytest.fail(f"dataset does not describe the benchmarked shape: {mismatch}")
     tokens_per_rank = shape.get("tokens_per_rank")
     if not isinstance(tokens_per_rank, int) or tokens_per_rank <= 0:
         pytest.fail(f"manifest tokens_per_rank is invalid: {tokens_per_rank!r}")
@@ -407,7 +407,7 @@ def test_hopper_megamoe_benchmark():
             continue
         sweep.append(tokens)
     if not sweep:
-        pytest.skip("no benchmarked token count fits this dataset and kernel")
+        pytest.fail("no benchmarked token count fits this dataset and kernel")
 
     metrics = []
     failures = []
