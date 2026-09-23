@@ -3002,7 +3002,9 @@ def run_worker() -> int:
     NK2 = INTER // BLOCK_K
     NPAIR = BLOCK_N // 16
     NSF = K // 128
-    MAX_RECV = 512
+    MAX_RECV = int(os.environ.get("W_MAX_RECV", "512"))
+    if MAX_RECV <= 0:
+        raise ValueError(f"W_MAX_RECV must be positive: {MAX_RECV}")
     # Dispatch route tile.  Keep the historical default for old versions, but
     # expose it so newer experiments can match the two-warp CUDA frontend
     # (one route per lane, i.e. 2 * 32 routes per CTA).
@@ -3108,6 +3110,18 @@ def run_worker() -> int:
         [[len(q_ref[o][le][s]) for s in range(R)] for le in range(EPR)]
         for o in range(R)
     ]
+    peak_recv = max(
+        counts[o][le][src]
+        for o in range(R)
+        for le in range(EPR)
+        for src in range(R)
+    )
+    if peak_recv > MAX_RECV:
+        raise ValueError(
+            f"real routes/source/expert={peak_recv} exceed MAX_RECV={MAX_RECV}"
+        )
+    if rank == 0:
+        print(f"QUEUE_CAPACITY max_recv={MAX_RECV} peak_routes={peak_recv}", flush=True)
     n_le = [[sum(counts[o][le]) for le in range(EPR)] for o in range(R)]
     blocks = [[(n + BLOCK_M - 1) // BLOCK_M for n in n_le[o]] for o in range(R)]
     pool_off = [[sum(blocks[o][:le]) for le in range(EPR)] for o in range(R)]
