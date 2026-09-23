@@ -2600,7 +2600,7 @@ def ws_megakernel(
     tl.static_assert(FAST_NVLINK_BARRIER, "snapshot fixes fast NVLink barrier")
     tl.static_assert(D8_PULL_STREAMS == 2, "snapshot fixes two D8 pull streams")
     tl.static_assert(BLOCK_R == 256, "snapshot fixes BLOCK_R=256")
-    tl.static_assert(DISPATCH_WARPS == 4, "snapshot fixes dispatch launch warps")
+    tl.static_assert(DISPATCH_WARPS == 2, "snapshot fixes dispatch role warps")
     tl.static_assert(MATH_WARPS == 4, "snapshot fixes math warps")
 
     a_s = tle.gpu.alloc(
@@ -3315,7 +3315,7 @@ def run_worker() -> int:
         USE_SMEM_EXPERT_COUNT=(USE_SMEM_EXPERT_COUNT != 0),
         FAST_NVLINK_BARRIER=(FAST_NVLINK_BARRIER != 0),
         D8_PULL_STREAMS=D8_PULL_STREAMS,
-        DISPATCH_WARPS=4,
+        DISPATCH_WARPS=2,
         MATH_WARPS=4,
         num_warps=LOADER_WARPS,
     )

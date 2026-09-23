@@ -97,29 +97,44 @@ import torch
 from .conftest import Config, emit_record_logger, update_result
 from .consts import BenchmarkMetrics, BenchmarkResult
 
+_MEGAMOE_MODULE = "flaggems_vllm.runtime.backend._nvidia.hopper.mega.megamoe"
+
 try:
     from flaggems_vllm.runtime.backend._nvidia.hopper.mega.megamoe import (
         MEGAMOE_KERNEL_PATH,
     )
-except Exception:  # non-NVIDIA builds do not ship the Hopper mega kernels
+except ModuleNotFoundError as exc:
+    # A non-NVIDIA package may omit this module or one of its parent packages.
+    # Do not turn a missing dependency or another package-import bug into a
+    # skipped benchmark.
+    if exc.name is None or not (
+        exc.name == _MEGAMOE_MODULE or _MEGAMOE_MODULE.startswith(f"{exc.name}.")
+    ):
+        raise
     MEGAMOE_KERNEL_PATH = None
 
 OP_NAME = "hopper_megamoe"
 
-# The previously validated UserHopper-aligned launch shape.  The candidate has
-# no autotune table and no registered generic API, so the shape is fixed here
-# rather than read from core_shapes.yaml.
-NUM_RANKS = 8
-HIDDEN = 4096
-INTERMEDIATE = 1536
-NUM_EXPERTS = 128
-TOPK = 8
-STAGES = 4
+
+# The defaults are the previously validated UserHopper-aligned launch shape.
+# Keep the benchmark geometry tied to the same variables consumed by kernel.py
+# so a different real-data manifest does not require editing this file.
+def _shape_env(name, default):
+    raw = os.environ.get(name, "").strip()
+    return int(raw) if raw else default
+
+
+NUM_RANKS = _shape_env("MEGAMOE_NP", 8)
+HIDDEN = _shape_env("W_K", 4096)
+INTERMEDIATE = _shape_env("W_INTER", 1536)
+NUM_EXPERTS = _shape_env("W_NEXP", 128)
+TOPK = _shape_env("W_TOPK", 8)
+STAGES = _shape_env("W_STAGES", 4)
 
 # kernel.py sizes the per (local expert, source rank) dispatch queue with this
 # constant.  Real Qwen3 routing is imbalanced, so a token count whose hottest
 # queue would exceed it is dropped from the sweep instead of overrunning it.
-MAX_RECV = 512
+MAX_RECV = _shape_env("W_MAX_RECV", 512)
 
 DEFAULT_TOKENS = (512, 1024, 2048)
 DEFAULT_WARMUP = 10
@@ -269,42 +284,66 @@ def _child_env(root, tokens, warmup, iters, timeout_s, launcher):
     return env
 
 
-def _kill_process_group(expired):
-    """Tear down mpirun and every rank left behind by a timed-out run."""
-    pid = getattr(expired, "pid", None)
-    if pid is None:
-        return
-    for sig in (signal.SIGTERM, signal.SIGKILL):
+def _terminate_process_group(proc):
+    """Stop the benchmark session and collect its final output."""
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+
+    try:
+        return proc.communicate(timeout=5)
+    except subprocess.TimeoutExpired:
         try:
-            os.killpg(os.getpgid(pid), sig)
-        except (ProcessLookupError, PermissionError):
-            return
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        return proc.communicate()
+
+
+def _failure_output(summary, stdout, stderr):
+    return (
+        f"{summary}\n--- stdout tail ---\n{(stdout or '')[-3000:]}\n"
+        f"--- stderr tail ---\n{(stderr or '')[-2000:]}"
+    )
 
 
 def _run_one(root, tokens, warmup, iters, timeout_s, launcher):
     """Run one token count end to end and return its per-rank BENCH rows."""
     env = _child_env(root, tokens, warmup, iters, timeout_s, launcher)
+    proc = subprocess.Popen(
+        [_interpreter(), str(MEGAMOE_KERNEL_PATH)],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        # mpirun and the ranks are grandchildren, so the timeout kill has to
+        # reach the whole group.  Killing the entry point alone would leave
+        # eight workers holding a GPU, a CUDA context and a symmetric heap,
+        # and the next token count in the sweep would run against them.
+        start_new_session=True,
+    )
     try:
-        proc = subprocess.run(
-            [_interpreter(), str(MEGAMOE_KERNEL_PATH)],
-            env=env,
-            capture_output=True,
-            text=True,
-            # The entry point applies W_TIMEOUT to mpirun itself; leave it room
-            # to report that timeout rather than being killed mid-report.
-            timeout=timeout_s + 120,
-            # mpirun and the ranks are grandchildren, so the timeout kill has to
-            # reach the whole group.  Killing the entry point alone would leave
-            # eight workers holding a GPU, a CUDA context and a symmetric heap,
-            # and the next token count in the sweep would run against them.
-            start_new_session=True,
+        # The entry point applies W_TIMEOUT to mpirun itself; leave it room to
+        # report that timeout rather than being killed mid-report.
+        stdout, stderr = proc.communicate(timeout=timeout_s + 120)
+    except subprocess.TimeoutExpired:
+        stdout, stderr = _terminate_process_group(proc)
+        return [], _failure_output(
+            f"timed out after {timeout_s + 120}s (process group killed)",
+            stdout,
+            stderr,
         )
-    except subprocess.TimeoutExpired as expired:
-        _kill_process_group(expired)
-        return [], f"timed out after {timeout_s + 120}s (process group killed)"
+
+    if proc.returncode != 0:
+        return [], _failure_output(
+            f"MegaMoE entry point exited with status {proc.returncode}",
+            stdout,
+            stderr,
+        )
 
     rows = {}
-    for line in proc.stdout.splitlines():
+    for line in stdout.splitlines():
         match = BENCH_LINE.search(line)
         if match is None:
             continue
@@ -318,12 +357,10 @@ def _run_one(root, tokens, warmup, iters, timeout_s, launcher):
         }
 
     if len(rows) != NUM_RANKS:
-        tail = (proc.stdout or "")[-3000:]
-        stderr_tail = (proc.stderr or "")[-2000:]
-        return [], (
-            f"expected {NUM_RANKS} BENCH rows, parsed {len(rows)} "
-            f"(exit={proc.returncode})\n--- stdout tail ---\n{tail}\n"
-            f"--- stderr tail ---\n{stderr_tail}"
+        return [], _failure_output(
+            f"expected {NUM_RANKS} BENCH rows, parsed {len(rows)}",
+            stdout,
+            stderr,
         )
     return [rows[rank] for rank in sorted(rows)], None
 
