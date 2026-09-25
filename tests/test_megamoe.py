@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""CPU tests for the Hopper MegaMoE data-layout contract."""
+"""Tests for the MegaMoE data-layout contract."""
 
 import pytest
 import torch
@@ -21,7 +21,18 @@ from flaggems_vllm.runtime.backend._nvidia.hopper.mega.megamoe.qwen3_fp8_shared_
     interleave_l1_gate_up_rows,
 )
 
-pytestmark = pytest.mark.hopper_megamoe
+MEGAMOE_LAYOUT_CONFIGS = [
+    # (num_experts, rows, hidden_size, tile_rows)
+    (1, 32, 1, 8),
+    (2, 24, 3, 4),
+]
+
+MEGAMOE_INVALID_LAYOUT_CONFIGS = [
+    # (shape, tile_rows, expected error)
+    ((4, 8), 8, "rank 3"),
+    ((1, 15, 2), 1, "row count must be even"),
+    ((1, 20, 2), 8, "must be divisible"),
+]
 
 
 def _reference_interleave(weight, granularity):
@@ -37,15 +48,11 @@ def _reference_interleave(weight, granularity):
     return torch.cat(chunks, dim=1)
 
 
-@pytest.mark.parametrize(
-    "experts, rows, hidden, granularity",
-    [
-        (1, 32, 1, 8),
-        (2, 24, 3, 4),
-    ],
-)
-def test_interleave_l1_gate_up_rows(experts, rows, hidden, granularity):
-    source = torch.arange(experts * rows * hidden, dtype=torch.int32).reshape(
+@pytest.mark.megamoe
+@pytest.mark.parametrize("config", MEGAMOE_LAYOUT_CONFIGS)
+def test_megamoe_w1_layout(config):
+    experts, rows, hidden, granularity = config
+    source = torch.arange(experts * rows * hidden, dtype=torch.uint8).reshape(
         experts, rows, hidden
     )
 
@@ -56,15 +63,10 @@ def test_interleave_l1_gate_up_rows(experts, rows, hidden, granularity):
     assert actual.is_contiguous()
 
 
-@pytest.mark.parametrize(
-    "shape, granularity, error",
-    [
-        ((4, 8), 8, "rank 3"),
-        ((1, 15, 2), 1, "row count must be even"),
-        ((1, 20, 2), 8, "must be divisible"),
-    ],
-)
-def test_interleave_l1_gate_up_rows_rejects_invalid_layout(shape, granularity, error):
+@pytest.mark.megamoe
+@pytest.mark.parametrize("config", MEGAMOE_INVALID_LAYOUT_CONFIGS)
+def test_megamoe_w1_layout_rejects_invalid_shape(config):
+    shape, granularity, error = config
     weight = torch.empty(shape, dtype=torch.uint8)
 
     with pytest.raises(ValueError, match=error):

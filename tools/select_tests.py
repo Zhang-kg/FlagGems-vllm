@@ -63,10 +63,6 @@ ENV_SMOKE_TRIGGER_PREFIXES = (
 # backend; do not put capability-specific operators here.
 ENV_SMOKE_TESTS: list[str] = []
 
-HOPPER_MEGAMOE_PREFIX = "src/flaggems_vllm/runtime/backend/_nvidia/hopper/mega/megamoe/"
-HOPPER_MEGAMOE_TEST = "tests/test_hopper_megamoe.py"
-HOPPER_MEGAMOE_BENCHMARK = "benchmark/test_hopper_megamoe_perf.py"
-
 FULL_TEST_TRIGGER_FILES = {
     "src/flaggems_vllm/__init__.py",
     "src/flaggems_vllm/config.py",
@@ -251,9 +247,6 @@ def matching_targets_for_stem(stem: str, targets: set[str], root: str) -> list[s
 
 
 def tests_for_source(path: str, tests: set[str]) -> list[str]:
-    if path.startswith(HOPPER_MEGAMOE_PREFIX):
-        return [HOPPER_MEGAMOE_TEST] if HOPPER_MEGAMOE_TEST in tests else []
-
     if path in EXPLICIT_SOURCE_TO_TESTS:
         return [test for test in EXPLICIT_SOURCE_TO_TESTS[path] if test in tests]
 
@@ -272,11 +265,6 @@ def tests_for_source(path: str, tests: set[str]) -> list[str]:
 
 
 def benchmarks_for_source(path: str, benchmarks: set[str]) -> list[str]:
-    if path.startswith(HOPPER_MEGAMOE_PREFIX):
-        return (
-            [HOPPER_MEGAMOE_BENCHMARK] if HOPPER_MEGAMOE_BENCHMARK in benchmarks else []
-        )
-
     if path in EXPLICIT_SOURCE_TO_BENCHMARKS:
         return [
             benchmark

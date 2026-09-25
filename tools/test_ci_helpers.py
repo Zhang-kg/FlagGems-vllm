@@ -94,22 +94,6 @@ class SelectTestsTest(TemporaryRepositoryTestCase):
         self.assertEqual(tests, ["tests/test_mul.py"])
         self.assertEqual(benchmarks, [])
 
-    def test_hopper_megamoe_change_selects_test_and_benchmark(self):
-        self.make_file("tests/test_hopper_megamoe.py")
-        self.make_file("benchmark/test_hopper_megamoe_perf.py")
-
-        mode, tests, benchmarks = select_tests.select_targets(
-            self.repo_root,
-            [
-                "src/flaggems_vllm/runtime/backend/_nvidia/hopper/mega/"
-                "megamoe/kernel.py"
-            ],
-        )
-
-        self.assertEqual(mode, "smoke")
-        self.assertEqual(tests, ["tests/test_hopper_megamoe.py"])
-        self.assertEqual(benchmarks, ["benchmark/test_hopper_megamoe_perf.py"])
-
     def test_documentation_change_is_skipped(self):
         self.assertEqual(
             select_tests.select_targets(self.repo_root, ["docs/guide.md"]),
