@@ -31,7 +31,12 @@ import pytest
 import torch
 
 from .conftest import Config, emit_record_logger, update_result
-from .consts import BenchmarkMetrics, BenchmarkResult
+from .consts import (
+    DEFAULT_ITER_TIME,
+    DEFAULT_WARMUP_TIME,
+    BenchmarkMetrics,
+    BenchmarkResult,
+)
 
 _MEGAMOE_MODULE = "flaggems_vllm.runtime.backend._nvidia.hopper.mega.megamoe"
 
@@ -81,6 +86,16 @@ BENCH_LINE = re.compile(
     r"experts=(?P<experts_per_rank>\d+) \|\s*(?P<us>[0-9.]+) us\s+"
     r"(?P<tflops>[0-9.]+) TFLOPS"
 )
+
+
+def _iteration_count(name, configured, configured_default, fallback):
+    """Resolve fixed iteration counts while honoring pytest benchmark options."""
+    raw = os.environ.get(name, "").strip()
+    if raw:
+        return int(raw)
+    if configured != configured_default:
+        return configured
+    return fallback
 
 
 def _env_int(name, default):
@@ -284,8 +299,18 @@ def test_megamoe():
     data_dir = os.path.abspath(
         os.path.expanduser(os.environ["MEGAMOE_SHARED_DATA_DIR"].strip())
     )
-    warmup = _env_int("MEGAMOE_BENCH_WARMUP", DEFAULT_WARMUP)
-    iters = _env_int("MEGAMOE_BENCH_ITERS", DEFAULT_ITERS)
+    warmup = _iteration_count(
+        "MEGAMOE_BENCH_WARMUP",
+        Config.warm_up,
+        DEFAULT_WARMUP_TIME,
+        DEFAULT_WARMUP,
+    )
+    iters = _iteration_count(
+        "MEGAMOE_BENCH_ITERS",
+        Config.repetition,
+        DEFAULT_ITER_TIME,
+        DEFAULT_ITERS,
+    )
     timeout_s = _env_int("MEGAMOE_BENCH_TIMEOUT", DEFAULT_TIMEOUT_S)
 
     metrics = []
