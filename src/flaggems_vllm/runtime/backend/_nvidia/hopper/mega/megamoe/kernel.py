@@ -12,233 +12,42 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""V234 standalone: v220 with the real SM90 W1 weight/SF layout contract.
+"""SM90 FP8 expert-parallel MegaMoE kernel.
 
-This immutable snapshot contains the complete Python implementation and host
-harness.  It does not import or monkey-patch an earlier experiment version.
-Relative to v208, the L1 A+SFA producer transfers its single required SF row
-through a matching ``[1, BLOCK_M]`` descriptor and SMEM view.  L2 retains its
-two-row SF transfer.
-
-One process per rank (mpirun -np R). Rank r owns experts [r*EPR, (r+1)*EPR) and
-holds NTOK local tokens, exactly like sm90_fp8_mega_moe.cuh.
-
-`sym_buffer.map(ptr, rank)` becomes a peer pointer into the NVSHMEM symmetric
-heap: the host builds an int64[NPES] table from nvshmem_ptr(buf, pe) and the
-kernel does `tl.load(tab + pe).to(tl.pointer_type(dtype))`. All remote traffic is
-then ordinary NVLink P2P load/store plus system-scope atomics -- which is exactly
-what UserHopper does (it has no device-side nvshmem calls either).
-
-The four sym_buffer.map sites of the CUDA kernel, and their TLE form:
-  D3   *sym_buffer.map(dst_ptr, owner)      -> peer_i32(q_tab, owner)      [VECTOR of owners]
-  D4   recv_count/_sum on the owner         -> peer_i64(recv/rsum_tab, owner), scope="sys"
-  pull remote token / SF / weight           -> peer_fp8/f32(tok/sf/w_tab, src_rank)
-  L2   combine buffer on the SOURCE rank    -> peer_bf16(cb_tab, dst_rank)  [VECTOR of dsts]
-  comm::nvlink_barrier (barrier.cuh:38-80)  -> SM0 release.sys-adds every peer's signal
-                                               slot, spins on its own with acquire.sys,
-                                               wrapped in intra-rank grid syncs.
-
-SFA IS NOW TMA TOO. Earlier I wrongly called the SF tile a "strided gather": the SF
-buffers are MN-major, `sf[k_group * padded_tokens + token]`, so a block's SF tile is
-BLOCK_M *contiguous* floats -- a perfectly valid TMA box `[1, BLOCK_M]`. That is
-exactly what CUDA does (`tma::copy<BLOCK_M, 1, 0, float>`), issuing ONE box for L1
-(per-128 SF) and TWO adjacent k-groups for L2 (per-64 SF), landing at smem +0 and
-+BLOCK_M (sm90_fp8_mega_moe.cuh:786-805). Here that is two pipe fields sfa_lo/sfa_hi.
-
-The WEIGHT SF (SFB) is deliberately NOT staged: CUDA says so itself at the B loader,
-"TMA load B (weight SF is now loaded directly by math warps from global)". So the math
-role loads sfb straight from global, as it does in CUDA.
-
-Consequence: every pipe field is now a TMA field, so the "a pipe commit may not mix TMA
-and tl.store fields" constraint disappears and the two pipes collapse back into ONE.
-
-The D8 FP8 token load/store pair uses the same descriptorless
-``cp.async.bulk`` TMA1D mechanism as UserHopper. Activation SF and top-k weight
-remain ordinary load/store. Each pull stream owns one 4 KiB token stage and its
-raw mbarrier state; the raw helper is limited to route selection and D6-D9.
-
-V22 DIAGNOSTIC: move the activation-SF SMEM loads after async WGMMA issue and
-before `wgmma_wait`, matching the overlap window in UserHopper SM90
-`sm90_fp8_mega_moe.cuh:976-1007,1054-1093`. Weight-SF prefetch is intentionally
-unchanged; that separate idea was already tested by v8.
-
-V23 L2 EPILOGUE: stage the BF16 accumulator and one destination pointer per row
-in linear SMEM, then cross a narrow raw-CUDA boundary which remaps the physical
-math warpgroup exactly like UserHopper: 16 lanes own one row and each lane issues
-one 16-byte load/store. This fixes both reasons v12-v14 stayed scalar: a gathered
-peer base is not compiler-contiguous, and the WGMMA accumulator fragment does not
-give each lane eight adjacent BF16 values. The raw ABI carries only integer-encoded
-SMEM addresses because mixed addrspace(3)/addrspace(1) pointers do not link in the
-current TLE raw implementation.
-
-TEST-ONLY: `meta` and `l2_out` are also placed on the symmetric heap so each rank
-can read a peer's copy and check the cross-rank scatter EXACTLY.
-
-Run this file directly.  Runtime and shape configuration is expressed through
-command-line options; the parent launcher forwards the same options to every
-MPI worker.
+Each rank owns a contiguous expert shard. A persistent TLE kernel combines
+routing, NVLink dispatch and pull, FP8 L1/SwiGLU/L2 compute, remote scatter, and
+final reduction in one launch.
 """
 
 from __future__ import annotations
 
-import argparse
 import ctypes
 import os
-import shutil
-import subprocess
 import sys
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from pathlib import Path
 
 SUPPORT_DIR = Path(__file__).resolve().parent
 
-
-@dataclass(frozen=True)
-class MegaMoEConfig:
-    """Configuration shared by the launcher and every MPI worker."""
-
-    worker: bool = False
-    num_ranks: int = 2
-    tokens: int = 128
-    hidden_size: int = 256
-    intermediate_size: int = 128
-    num_experts: int = 16
-    topk: int = 4
-    stages: int = 2
-    num_sms: int = 0
-    max_recv: int = 512
-    drop_rate: float = 0.1
-    benchmark: bool = False
-    warmup: int = 5
-    iterations: int = 20
-    reduce: str = "median"
-    gpu_start_barrier: bool = False
-    data_dir: Path | None = None
-    verify_data_sha256: bool = False
-    inject_fault: str | None = None
-    mpirun: str = "/usr/bin/mpirun"
-    timeout: int = 600
-    cuda_home: Path | None = None
-    nvshmem_home: Path | None = None
-
-
-def _config_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description="Run the Hopper MegaMoE standalone launcher."
+if __package__:
+    from ._launcher import (  # noqa: E402
+        MegaMoEConfig,
+        launch_megamoe_cli,
+        parse_megamoe_config,
     )
-    parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
-    parser.add_argument("--num-ranks", type=int, default=2)
-    parser.add_argument("--tokens", type=int, default=128)
-    parser.add_argument("--hidden-size", type=int, default=256)
-    parser.add_argument("--intermediate-size", type=int, default=128)
-    parser.add_argument("--num-experts", type=int, default=16)
-    parser.add_argument("--topk", type=int, default=4)
-    parser.add_argument("--stages", type=int, default=2)
-    parser.add_argument("--num-sms", type=int, default=0)
-    parser.add_argument("--max-recv", type=int, default=512)
-    parser.add_argument("--drop-rate", type=float)
-    parser.add_argument("--benchmark", action="store_true")
-    parser.add_argument("--warmup", type=int, default=5)
-    parser.add_argument("--iterations", type=int, default=20)
-    parser.add_argument("--reduce", choices=("mean", "median"), default="median")
-    parser.add_argument("--gpu-start-barrier", action="store_true")
-    parser.add_argument("--data-dir", type=Path)
-    parser.add_argument("--verify-data-sha256", action="store_true")
-    parser.add_argument(
-        "--inject-fault",
-        choices=("queue", "recv", "meta", "scatter", "combine"),
+else:
+    from _launcher import (  # noqa: E402
+        MegaMoEConfig,
+        launch_megamoe_cli,
+        parse_megamoe_config,
     )
-    parser.add_argument("--mpirun", default=shutil.which("mpirun") or "/usr/bin/mpirun")
-    parser.add_argument("--timeout", type=int, default=600)
-    parser.add_argument("--cuda-home", type=Path)
-    parser.add_argument("--nvshmem-home", type=Path)
-    return parser
 
+CONFIG = parse_megamoe_config() if __name__ == "__main__" else MegaMoEConfig()
 
-def _parse_config(argv: list[str] | None = None) -> MegaMoEConfig:
-    args = _config_parser().parse_args(argv)
-    if args.drop_rate is None:
-        args.drop_rate = 0.0 if args.data_dir is not None else 0.1
-    config = MegaMoEConfig(**vars(args))
-    if config.num_ranks <= 0:
-        raise ValueError("--num-ranks must be positive")
-    if config.tokens <= 0:
-        raise ValueError("--tokens must be positive")
-    if config.hidden_size <= 0 or config.hidden_size % 128:
-        raise ValueError("--hidden-size must be a positive multiple of 128")
-    if config.intermediate_size <= 0 or config.intermediate_size % 64:
-        raise ValueError("--intermediate-size must be a positive multiple of 64")
-    if config.num_experts <= 0 or config.num_experts % config.num_ranks:
-        raise ValueError("--num-experts must be positive and divisible by --num-ranks")
-    if not 0 < config.topk <= config.num_experts:
-        raise ValueError("--topk must be in [1, num_experts]")
-    if config.stages <= 0:
-        raise ValueError("--stages must be positive")
-    if config.num_sms < 0:
-        raise ValueError("--num-sms cannot be negative")
-    if config.max_recv <= 0:
-        raise ValueError("--max-recv must be positive")
-    if not 0.0 <= config.drop_rate < 1.0:
-        raise ValueError("--drop-rate must be in [0, 1)")
-    if config.warmup < 0 or config.iterations <= 0:
-        raise ValueError(
-            "--warmup cannot be negative and --iterations must be positive"
-        )
-    if config.timeout <= 0:
-        raise ValueError("--timeout must be positive")
-    if config.data_dir is not None and config.drop_rate != 0.0:
-        raise ValueError("--data-dir requires --drop-rate=0")
-    return config
-
-
-def _worker_cli_args(config: MegaMoEConfig) -> list[str]:
-    args = [
-        "--worker",
-        "--num-ranks",
-        str(config.num_ranks),
-        "--tokens",
-        str(config.tokens),
-        "--hidden-size",
-        str(config.hidden_size),
-        "--intermediate-size",
-        str(config.intermediate_size),
-        "--num-experts",
-        str(config.num_experts),
-        "--topk",
-        str(config.topk),
-        "--stages",
-        str(config.stages),
-        "--num-sms",
-        str(config.num_sms),
-        "--max-recv",
-        str(config.max_recv),
-        "--drop-rate",
-        str(config.drop_rate),
-        "--warmup",
-        str(config.warmup),
-        "--iterations",
-        str(config.iterations),
-        "--reduce",
-        config.reduce,
-    ]
-    if config.benchmark:
-        args.append("--benchmark")
-    if config.gpu_start_barrier:
-        args.append("--gpu-start-barrier")
-    if config.data_dir is not None:
-        args.extend(("--data-dir", str(config.data_dir)))
-    if config.verify_data_sha256:
-        args.append("--verify-data-sha256")
-    if config.inject_fault is not None:
-        args.extend(("--inject-fault", config.inject_fault))
-    if config.cuda_home is not None:
-        args.extend(("--cuda-home", str(config.cuda_home)))
-    if config.nvshmem_home is not None:
-        args.extend(("--nvshmem-home", str(config.nvshmem_home)))
-    return args
-
-
-CONFIG = _parse_config() if __name__ == "__main__" else MegaMoEConfig()
+# A normal CLI invocation is only a launcher.  Exit before importing Triton so
+# the parent process stays lightweight; MPI workers continue below.
+if __name__ == "__main__" and not CONFIG.worker:
+    sys.exit(launch_megamoe_cli(CONFIG))
 
 if __package__:
     from .qwen3_fp8_shared_data import (  # noqa: E402
@@ -254,7 +63,6 @@ if __package__:
         _import_env,
     )
 else:
-    sys.path.insert(0, str(SUPPORT_DIR))
     from qwen3_fp8_shared_data import (  # noqa: E402
         fp8_from_uint8,
         interleave_l1_gate_up_rows,
@@ -300,23 +108,8 @@ _cuda_runtime._resolve_clang.cache_clear()
 
 RAW_DIR = Path(__file__).resolve().parent
 
-# Versioned experiments may opt into releasing a GEMM pipe slot immediately
-# after WGMMA has stopped consuming its SMEM operands.  Keep the historical
-# v33-v40 ordering as the default; v150 flips this module constant before the
-# JIT dependency graph is built.
-EARLY_PIPE_RELEASE = tl.constexpr(False)
-# V157 opts into a per-thread mbarrier release after WGMMA completion. Keep
-# every historical version on the elected-thread release path by default.
-PARTICIPANT_PIPE_RELEASE = False
-# Default (non-specialized) loader role width.  Kept at four for all existing
-# versions; v159 overrides it to test whether TLE can avoid two idle frontend
-# warps and move the CTA shape toward UserHopper's 384 threads.
+# Loader role width used by the current kernel configuration.
 LOADER_WARPS = 4
-# UserHopper's TMA loaders do not join the dispatch/epilogue pre-pull barrier.
-# They poll the finalized rsum status words directly and can therefore prepare
-# their scheduler before dispatch releases the math warps.  Historical versions
-# retain the conservative meta_ready wait; v160 opts into the CUDA-shaped path.
-LOADER_RSUM_EARLY = False
 
 
 @dialect(
@@ -333,16 +126,6 @@ def l2_wide_scatter_edsl(*args, **kwargs): ...
     extern_func_name="TleL2TmaScatter",
 )
 def l2_tma_scatter_edsl(*args, **kwargs): ...
-
-
-@dialect(
-    name="cuda",
-    compiler="nvcc",
-    file=RAW_DIR / "raw_d8_tma1d_pull.cu",
-    extern=RAW_DIR / "raw_d8_tma1d_pull_extern.py",
-    extern_func_name="TleD8Tma1d",
-)
-def d8_tma1d_edsl(*args, **kwargs): ...
 
 
 @dialect(
@@ -374,18 +157,8 @@ def peer_i64(tab, pe):
 
 
 @triton.jit
-def peer_f32(tab, pe):
-    return tl.load(tab + pe).to(tl.pointer_type(tl.float32))
-
-
-@triton.jit
 def peer_bf16(tab, pe):
     return tl.load(tab + pe).to(tl.pointer_type(tl.bfloat16))
-
-
-@triton.jit
-def peer_fp8(tab, pe):
-    return tl.load(tab + pe).to(tl.pointer_type(tl.float8e4nv))
 
 
 @triton.jit
@@ -526,22 +299,6 @@ def pool_layout(rsum, EPR: tl.constexpr, EPR_POW2: tl.constexpr, BLOCK_M: tl.con
 
 
 @triton.jit
-def split_last(x, D0: tl.constexpr, D1: tl.constexpr):
-    """[D0, D1] -> two [D0, D1//2] along the LAST axis."""
-    t = tl.reshape(x, (D0, 2, D1 // 2))
-    t = tl.permute(t, (0, 2, 1))
-    return tl.split(t)
-
-
-@triton.jit
-def split_first(x, D0: tl.constexpr, D1: tl.constexpr):
-    """[D0, D1] -> two [D0//2, D1] along the FIRST axis."""
-    t = tl.reshape(x, (2, D0 // 2, D1))
-    t = tl.permute(t, (1, 2, 0))
-    return tl.split(t)
-
-
-@triton.jit
 def pick(vec, idx, EPR_POW2: tl.constexpr):
     """Extract one dynamic scalar without one-hot reduction lowering."""
     index = tl.full((1,), idx, tl.int32)
@@ -549,7 +306,7 @@ def pick(vec, idx, EPR_POW2: tl.constexpr):
 
 
 # ---------------------------------------------------------------------------
-# symmetric-heap byte helpers (host plumbing only)
+# symmetric-heap initialization helpers
 # ---------------------------------------------------------------------------
 @triton.jit
 def sym_zero(tab, PE, NB, BLOCK: tl.constexpr):
@@ -562,1095 +319,6 @@ def sym_h2d(src, tab, PE, NB, BLOCK: tl.constexpr):
     offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     m = offs < NB
     tl.store(peer_i8(tab, PE) + offs, tl.load(src + offs, mask=m), mask=m)
-
-
-@triton.jit
-def sym_d2h(tab, PE, dst, NB, BLOCK: tl.constexpr):
-    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-    m = offs < NB
-    tl.store(dst + offs, tl.load(peer_i8(tab, PE) + offs, mask=m), mask=m)
-
-
-@triton.jit
-def _pick_stream2(x, which: tl.constexpr):
-    stream = tl.arange(0, 2)
-    return tl.sum(tl.where(stream == which, x, 0), axis=0)
-
-
-@triton.jit
-def dispatch_dual_d8_pull(
-    sf_tab,
-    w_tab,
-    rsum_l,
-    recv_l,
-    q_l,
-    meta_l,
-    l1_arrival_count,
-    l1_token,
-    l1_sf,
-    l1_w,
-    d8_token_s,
-    d8_state_s,
-    tp0,
-    tp1,
-    tp2,
-    tp3,
-    tp4,
-    tp5,
-    tp6,
-    tp7,
-    MY_PE: tl.constexpr,
-    NPES: tl.constexpr,
-    NUM_SMS: tl.constexpr,
-    EPR: tl.constexpr,
-    R_POW2: tl.constexpr,
-    MAX_RECV: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    K: tl.constexpr,
-    NSF: tl.constexpr,
-    POOL_TOKENS: tl.constexpr,
-    TOPK: tl.constexpr,
-    NSF_POW2: tl.constexpr,
-    USE_D8_TMA1D: tl.constexpr,
-):
-    """Two independent descriptorless D8 streams, mirroring CUDA's 2 warps."""
-    sm_idx = tl.program_id(0)
-    stream = tl.arange(0, 2)
-    rank_v = tl.arange(0, R_POW2)
-    rank_ok = rank_v < NPES
-    offs_sf = tl.arange(0, NSF_POW2)
-    sf_ok = offs_sf < NSF
-
-    inactive = tl.full((), 0, tl.int32)
-    d8_bytes = tl.full((), K, tl.int32)
-    d8_init_op = tl.full((), 0, tl.int32)
-    d8_load_op = tl.full((), 1, tl.int32)
-    d8_store_op = tl.full((), 2, tl.int32)
-    d8_fence_op = tl.full((), 3, tl.int32)
-    stage0 = smem_generic_addr(tle.gpu.local_ptr(d8_token_s, (0,)))
-    stage1 = smem_generic_addr(tle.gpu.local_ptr(d8_token_s, (K,)))
-    state0 = smem_generic_addr(tle.gpu.local_ptr(d8_state_s, (0,)))
-    state1 = smem_generic_addr(tle.gpu.local_ptr(d8_state_s, (2,)))
-    init_addr = tl.cast(l1_token, tl.int64)
-    tle_raw.call(
-        d8_tma1d_edsl, [stage0, state0, init_addr, d8_bytes, inactive, d8_init_op]
-    )
-    tle_raw.call(
-        d8_tma1d_edsl, [stage1, state1, init_addr, d8_bytes, inactive, d8_init_op]
-    )
-    dispatch_sync(USE_D8_TMA1D)
-    tle_raw.call(
-        d8_tma1d_edsl, [stage0, state0, init_addr, d8_bytes, inactive, d8_fence_op]
-    )
-    tle_raw.call(
-        d8_tma1d_edsl, [stage1, state1, init_addr, d8_bytes, inactive, d8_fence_op]
-    )
-    dispatch_sync(USE_D8_TMA1D)
-
-    # Logical stream s owns global pool indices sm*2+s, striding by 2*NUM_SMS.
-    token_idx = sm_idx * 2 + stream
-    cur = tl.full((2,), -1, tl.int32)
-    e_start = tl.zeros((2,), tl.int32)
-    e_end = tl.zeros((2,), tl.int32)
-    pool_blk = tl.zeros((2,), tl.int32)
-    done = tl.zeros((2,), tl.int32)
-
-    while tl.sum((done == 0).to(tl.int32), axis=0) > 0:
-        need = (done == 0) & (token_idx >= e_end)
-        while tl.sum(need.to(tl.int32), axis=0) > 0:  # D6, two cursors
-            next_cur = cur + 1
-            ex = next_cur >= EPR
-            safe_cur = tl.where(ex, 0, next_cur)
-            n = (tl.load(rsum_l + safe_cur, mask=need & ~ex, other=0) & 0xFFFFFFFF).to(
-                tl.int32
-            )
-            add_blk = (e_end - e_start + BLOCK_M - 1) // BLOCK_M
-            advancing = need & ~ex
-            pool_blk = tl.where(advancing, pool_blk + add_blk, pool_blk)
-            e_start = tl.where(advancing, e_end, e_start)
-            e_end = tl.where(advancing, e_end + n, e_end)
-            cur = tl.where(need, next_cur, cur)
-            done = tl.where(need & ex, 1, done)
-            need = (done == 0) & (token_idx >= e_end)
-
-        live = done == 0
-        safe_e = tl.where(live, cur, 0)
-        tok_in_e = tl.where(live, token_idx - e_start, 0)
-
-        remaining = tl.load(
-            recv_l + rank_v[None, :] * EPR + safe_e[:, None],
-            mask=live[:, None] & rank_ok[None, :],
-            other=0,
-        ).to(tl.int32)
-        slot = tok_in_e
-        offset = tl.zeros((2,), tl.int32)
-        src_rank = tl.zeros((2,), tl.int32)
-        tir = tl.zeros((2,), tl.int32)
-        found = tl.where(live, 0, 1)
-        while tl.sum((found == 0).to(tl.int32), axis=0) > 0:  # D7, two routes
-            active = remaining > 0
-            num_active = tl.sum(active.to(tl.int32), axis=1)
-            length = tl.min(tl.where(active, remaining, 0x7FFFFFFF), axis=1)
-            nrt = length * num_active
-            hit = ((slot < nrt) | (num_active == 0)) & (found == 0)
-            denom = tl.maximum(num_active, 1)
-            sir = slot % denom
-            order = tl.cumsum(active.to(tl.int32), axis=1) - 1
-            sel = active & (order == sir[:, None])
-            selected_rank = tl.sum(tl.where(sel, rank_v[None, :], 0), axis=1)
-            src_rank = tl.where(hit, selected_rank, src_rank)
-            tir = tl.where(hit, offset + slot // denom, tir)
-            slot = tl.where(hit, slot, slot - nrt)
-            offset = tl.where(hit, offset, offset + length)
-            remaining = tl.where(
-                hit[:, None],
-                remaining,
-                remaining - tl.minimum(remaining, length[:, None]),
-            )
-            found = tl.where(hit, 1, found)
-
-        q_off = tl.where(live, (safe_e * NPES + src_rank) * MAX_RECV + tir, 0)
-        stt = tl.load(q_l + q_off, mask=live, other=0)
-        src_tok = stt // TOPK
-        src_topk = stt % TOPK
-        pt = tl.where(live, pool_blk * BLOCK_M + tok_in_e, 0)
-
-        peer_base = tp0
-        peer_base = tl.where(src_rank == 1, tp1, peer_base)
-        peer_base = tl.where(src_rank == 2, tp2, peer_base)
-        peer_base = tl.where(src_rank == 3, tp3, peer_base)
-        peer_base = tl.where(src_rank == 4, tp4, peer_base)
-        peer_base = tl.where(src_rank == 5, tp5, peer_base)
-        peer_base = tl.where(src_rank == 6, tp6, peer_base)
-        peer_base = tl.where(src_rank == 7, tp7, peer_base)
-        peer_tok = tl.multiple_of(peer_base.to(tl.pointer_type(tl.float8e4nv)), 16)
-        src_addr = tl.cast(peer_tok + src_tok * K, tl.int64)
-        dst_addr = tl.cast(l1_token + pt * K, tl.int64)
-        active_i32 = live.to(tl.int32)
-
-        # Enqueue both remote loads before either stream waits.
-        tle_raw.call(
-            d8_tma1d_edsl,
-            [
-                stage0,
-                state0,
-                _pick_stream2(src_addr, 0),
-                d8_bytes,
-                _pick_stream2(active_i32, 0),
-                d8_load_op,
-            ],
-        )
-        tle_raw.call(
-            d8_tma1d_edsl,
-            [
-                stage1,
-                state1,
-                _pick_stream2(src_addr, 1),
-                d8_bytes,
-                _pick_stream2(active_i32, 1),
-                d8_load_op,
-            ],
-        )
-        dispatch_sync(USE_D8_TMA1D)
-
-        sf_base = peer_f32(sf_tab, src_rank)
-        sfv = tl.load(
-            sf_base[:, None] + src_tok[:, None] * NSF + offs_sf[None, :],
-            mask=live[:, None] & sf_ok[None, :],
-            other=0.0,
-        )
-        tl.store(
-            l1_sf + offs_sf[None, :] * POOL_TOKENS + pt[:, None],
-            sfv,
-            mask=live[:, None] & sf_ok[None, :],
-        )
-        weight = tl.load(peer_f32(w_tab, src_rank) + stt, mask=live, other=0.0)
-        tl.store(l1_w + pt, weight, mask=live)
-        dispatch_sync(USE_D8_TMA1D)
-
-        tle_raw.call(
-            d8_tma1d_edsl,
-            [
-                stage0,
-                state0,
-                _pick_stream2(dst_addr, 0),
-                d8_bytes,
-                _pick_stream2(active_i32, 0),
-                d8_store_op,
-            ],
-        )
-        tle_raw.call(
-            d8_tma1d_edsl,
-            [
-                stage1,
-                state1,
-                _pick_stream2(dst_addr, 1),
-                d8_bytes,
-                _pick_stream2(active_i32, 1),
-                d8_store_op,
-            ],
-        )
-        dispatch_sync(USE_D8_TMA1D)
-
-        tl.store(meta_l + pt * 3 + 0, src_rank, mask=live)  # D9
-        tl.store(meta_l + pt * 3 + 1, src_tok, mask=live)
-        tl.store(meta_l + pt * 3 + 2, src_topk, mask=live)
-        tl.atomic_add(
-            l1_arrival_count + (pool_blk + tok_in_e // BLOCK_M),
-            1,
-            mask=live,
-            sem="release",
-        )
-        token_idx = tl.where(live, token_idx + NUM_SMS * 2, token_idx)
-
-
-@triton.jit
-def _resolve_one_d8_route(
-    token_idx,
-    cur,
-    e_start,
-    e_end,
-    pool_blk,
-    done,
-    rsum_l,
-    recv_l,
-    q_l,
-    NPES: tl.constexpr,
-    EPR: tl.constexpr,
-    R_POW2: tl.constexpr,
-    MAX_RECV: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    TOPK: tl.constexpr,
-):
-    while (done == 0) & (token_idx >= e_end):
-        cur += 1
-        ex = cur >= EPR
-        done = tl.where(ex, 1, 0)
-        safe_cur = tl.where(ex, 0, cur)
-        n = (tl.load(rsum_l + safe_cur) & 0xFFFFFFFF).to(tl.int32)
-        add_blk = (e_end - e_start + BLOCK_M - 1) // BLOCK_M
-        pool_blk = tl.where(ex, pool_blk, pool_blk + add_blk)
-        e_start = tl.where(ex, e_start, e_end)
-        e_end = tl.where(ex, e_end, e_end + n)
-
-    live = done == 0
-    safe_e = tl.where(live, cur, 0)
-    tok_in_e = tl.where(live, token_idx - e_start, 0)
-    rank_v = tl.arange(0, R_POW2)
-    rank_ok = rank_v < NPES
-    remaining = tl.where(
-        rank_ok & live,
-        tl.load(recv_l + rank_v * EPR + safe_e, mask=rank_ok, other=0).to(tl.int32),
-        0,
-    )
-    slot = tok_in_e
-    offset = 0
-    src_rank = 0
-    tir = 0
-    found = tl.where(live, 0, 1)
-    while found == 0:
-        active = remaining > 0
-        num_active = tl.sum(active.to(tl.int32), axis=0)
-        length = tl.min(tl.where(active, remaining, 0x7FFFFFFF), axis=0)
-        nrt = length * num_active
-        hit = (slot < nrt) | (num_active == 0)
-        denom = tl.maximum(num_active, 1)
-        sir = slot % denom
-        order = tl.cumsum(active.to(tl.int32), axis=0) - 1
-        sel = active & (order == sir)
-        src_rank = tl.where(hit, tl.sum(tl.where(sel, rank_v, 0), axis=0), src_rank)
-        tir = tl.where(hit, offset + slot // denom, tir)
-        slot = tl.where(hit, slot, slot - nrt)
-        offset = tl.where(hit, offset, offset + length)
-        remaining = tl.where(hit, remaining, remaining - tl.minimum(remaining, length))
-        found = tl.where(hit, 1, 0)
-
-    q_off = tl.where(live, (safe_e * NPES + src_rank) * MAX_RECV + tir, 0)
-    stt = tl.load(q_l + q_off, mask=live, other=0)
-    src_tok = stt // TOPK
-    src_topk = stt % TOPK
-    pt = tl.where(live, pool_blk * BLOCK_M + tok_in_e, 0)
-    return (
-        cur,
-        e_start,
-        e_end,
-        pool_blk,
-        done,
-        live,
-        tok_in_e,
-        src_rank,
-        stt,
-        src_tok,
-        src_topk,
-        pt,
-    )
-
-
-@triton.jit
-def _select_d8_peer(src_rank, tp0, tp1, tp2, tp3, tp4, tp5, tp6, tp7):
-    base = tp0
-    base = tl.where(src_rank == 1, tp1, base)
-    base = tl.where(src_rank == 2, tp2, base)
-    base = tl.where(src_rank == 3, tp3, base)
-    base = tl.where(src_rank == 4, tp4, base)
-    base = tl.where(src_rank == 5, tp5, base)
-    base = tl.where(src_rank == 6, tp6, base)
-    base = tl.where(src_rank == 7, tp7, base)
-    return base
-
-
-@triton.jit
-def dispatch_dual_d8_pull_scalar(
-    sf_tab,
-    w_tab,
-    rsum_l,
-    recv_l,
-    q_l,
-    meta_l,
-    l1_arrival_count,
-    l1_token,
-    l1_sf,
-    l1_w,
-    d8_token_s,
-    d8_state_s,
-    tp0,
-    tp1,
-    tp2,
-    tp3,
-    tp4,
-    tp5,
-    tp6,
-    tp7,
-    MY_PE: tl.constexpr,
-    NPES: tl.constexpr,
-    NUM_SMS: tl.constexpr,
-    EPR: tl.constexpr,
-    R_POW2: tl.constexpr,
-    MAX_RECV: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    K: tl.constexpr,
-    NSF: tl.constexpr,
-    POOL_TOKENS: tl.constexpr,
-    TOPK: tl.constexpr,
-    NSF_POW2: tl.constexpr,
-    USE_D8_TMA1D: tl.constexpr,
-):
-    sm_idx = tl.program_id(0)
-    offs_sf = tl.arange(0, NSF_POW2)
-    sf_ok = offs_sf < NSF
-    inactive = tl.full((), 0, tl.int32)
-    d8_bytes = tl.full((), K, tl.int32)
-    init_op = tl.full((), 0, tl.int32)
-    load_op = tl.full((), 1, tl.int32)
-    store_op = tl.full((), 2, tl.int32)
-    fence_op = tl.full((), 3, tl.int32)
-    stage0 = smem_generic_addr(tle.gpu.local_ptr(d8_token_s, (0,)))
-    stage1 = smem_generic_addr(tle.gpu.local_ptr(d8_token_s, (K,)))
-    state0 = smem_generic_addr(tle.gpu.local_ptr(d8_state_s, (0,)))
-    state1 = smem_generic_addr(tle.gpu.local_ptr(d8_state_s, (2,)))
-    init_addr = tl.cast(l1_token, tl.int64)
-    tle_raw.call(
-        d8_tma1d_edsl, [stage0, state0, init_addr, d8_bytes, inactive, init_op]
-    )
-    tle_raw.call(
-        d8_tma1d_edsl, [stage1, state1, init_addr, d8_bytes, inactive, init_op]
-    )
-    dispatch_sync(USE_D8_TMA1D)
-    tle_raw.call(
-        d8_tma1d_edsl, [stage0, state0, init_addr, d8_bytes, inactive, fence_op]
-    )
-    tle_raw.call(
-        d8_tma1d_edsl, [stage1, state1, init_addr, d8_bytes, inactive, fence_op]
-    )
-    dispatch_sync(USE_D8_TMA1D)
-
-    token0 = sm_idx * 2
-    token1 = sm_idx * 2 + 1
-    cur0 = -1
-    cur1 = -1
-    start0 = 0
-    start1 = 0
-    end0 = 0
-    end1 = 0
-    pool0 = 0
-    pool1 = 0
-    done0 = 0
-    done1 = 0
-    while (done0 == 0) | (done1 == 0):
-        (
-            cur0,
-            start0,
-            end0,
-            pool0,
-            done0,
-            live0,
-            tie0,
-            rank0,
-            stt0,
-            src_tok0,
-            src_topk0,
-            pt0,
-        ) = _resolve_one_d8_route(
-            token0,
-            cur0,
-            start0,
-            end0,
-            pool0,
-            done0,
-            rsum_l,
-            recv_l,
-            q_l,
-            NPES,
-            EPR,
-            R_POW2,
-            MAX_RECV,
-            BLOCK_M,
-            TOPK,
-        )
-        (
-            cur1,
-            start1,
-            end1,
-            pool1,
-            done1,
-            live1,
-            tie1,
-            rank1,
-            stt1,
-            src_tok1,
-            src_topk1,
-            pt1,
-        ) = _resolve_one_d8_route(
-            token1,
-            cur1,
-            start1,
-            end1,
-            pool1,
-            done1,
-            rsum_l,
-            recv_l,
-            q_l,
-            NPES,
-            EPR,
-            R_POW2,
-            MAX_RECV,
-            BLOCK_M,
-            TOPK,
-        )
-
-        base0 = _select_d8_peer(rank0, tp0, tp1, tp2, tp3, tp4, tp5, tp6, tp7)
-        base1 = _select_d8_peer(rank1, tp0, tp1, tp2, tp3, tp4, tp5, tp6, tp7)
-        peer0 = tl.multiple_of(base0.to(tl.pointer_type(tl.float8e4nv)), 16)
-        peer1 = tl.multiple_of(base1.to(tl.pointer_type(tl.float8e4nv)), 16)
-        src_addr0 = tl.cast(peer0 + src_tok0 * K, tl.int64)
-        src_addr1 = tl.cast(peer1 + src_tok1 * K, tl.int64)
-        active0 = tl.where(live0, 1, 0)
-        active1 = tl.where(live1, 1, 0)
-
-        # Both independent loads are in flight before either wait/store path.
-        tle_raw.call(
-            d8_tma1d_edsl, [stage0, state0, src_addr0, d8_bytes, active0, load_op]
-        )
-        tle_raw.call(
-            d8_tma1d_edsl, [stage1, state1, src_addr1, d8_bytes, active1, load_op]
-        )
-        dispatch_sync(USE_D8_TMA1D)
-
-        sfv0 = tl.load(
-            peer_f32(sf_tab, rank0) + src_tok0 * NSF + offs_sf,
-            mask=live0 & sf_ok,
-            other=0.0,
-        )
-        sfv1 = tl.load(
-            peer_f32(sf_tab, rank1) + src_tok1 * NSF + offs_sf,
-            mask=live1 & sf_ok,
-            other=0.0,
-        )
-        tl.store(l1_sf + offs_sf * POOL_TOKENS + pt0, sfv0, mask=live0 & sf_ok)
-        tl.store(l1_sf + offs_sf * POOL_TOKENS + pt1, sfv1, mask=live1 & sf_ok)
-        weight0 = tl.load(peer_f32(w_tab, rank0) + stt0, mask=live0, other=0.0)
-        weight1 = tl.load(peer_f32(w_tab, rank1) + stt1, mask=live1, other=0.0)
-        tl.store(l1_w + pt0, weight0, mask=live0)
-        tl.store(l1_w + pt1, weight1, mask=live1)
-        dispatch_sync(USE_D8_TMA1D)
-
-        dst_addr0 = tl.cast(l1_token + pt0 * K, tl.int64)
-        dst_addr1 = tl.cast(l1_token + pt1 * K, tl.int64)
-        tle_raw.call(
-            d8_tma1d_edsl, [stage0, state0, dst_addr0, d8_bytes, active0, store_op]
-        )
-        tle_raw.call(
-            d8_tma1d_edsl, [stage1, state1, dst_addr1, d8_bytes, active1, store_op]
-        )
-        dispatch_sync(USE_D8_TMA1D)
-
-        tl.store(meta_l + pt0 * 3 + 0, rank0, mask=live0)
-        tl.store(meta_l + pt0 * 3 + 1, src_tok0, mask=live0)
-        tl.store(meta_l + pt0 * 3 + 2, src_topk0, mask=live0)
-        tl.store(meta_l + pt1 * 3 + 0, rank1, mask=live1)
-        tl.store(meta_l + pt1 * 3 + 1, src_tok1, mask=live1)
-        tl.store(meta_l + pt1 * 3 + 2, src_topk1, mask=live1)
-        tl.atomic_add(
-            l1_arrival_count + (pool0 + tie0 // BLOCK_M), 1, mask=live0, sem="release"
-        )
-        tl.atomic_add(
-            l1_arrival_count + (pool1 + tie1 // BLOCK_M), 1, mask=live1, sem="release"
-        )
-        token0 = tl.where(live0, token0 + NUM_SMS * 2, token0)
-        token1 = tl.where(live1, token1 + NUM_SMS * 2, token1)
-
-
-@triton.jit
-def dispatch_d8_pingpong_pull(
-    sf_tab,
-    w_tab,
-    rsum_l,
-    recv_l,
-    q_l,
-    meta_l,
-    l1_arrival_count,
-    l1_token,
-    l1_sf,
-    l1_w,
-    d8_token_s,
-    d8_state_s,
-    tp0,
-    tp1,
-    tp2,
-    tp3,
-    tp4,
-    tp5,
-    tp6,
-    tp7,
-    MY_PE: tl.constexpr,
-    NPES: tl.constexpr,
-    NUM_SMS: tl.constexpr,
-    EPR: tl.constexpr,
-    R_POW2: tl.constexpr,
-    MAX_RECV: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    K: tl.constexpr,
-    NSF: tl.constexpr,
-    POOL_TOKENS: tl.constexpr,
-    TOPK: tl.constexpr,
-    NSF_POW2: tl.constexpr,
-    USE_D8_TMA1D: tl.constexpr,
-):
-    """One route scheduler feeding two independent TMA stage/mbarrier slots."""
-    sm_idx = tl.program_id(0)
-    offs_sf = tl.arange(0, NSF_POW2)
-    sf_ok = offs_sf < NSF
-    inactive = tl.full((), 0, tl.int32)
-    d8_bytes = tl.full((), K, tl.int32)
-    init_op = tl.full((), 0, tl.int32)
-    load_op = tl.full((), 1, tl.int32)
-    store_op = tl.full((), 2, tl.int32)
-    fence_op = tl.full((), 3, tl.int32)
-    stage0 = smem_generic_addr(tle.gpu.local_ptr(d8_token_s, (0,)))
-    stage1 = smem_generic_addr(tle.gpu.local_ptr(d8_token_s, (K,)))
-    state0 = smem_generic_addr(tle.gpu.local_ptr(d8_state_s, (0,)))
-    state1 = smem_generic_addr(tle.gpu.local_ptr(d8_state_s, (2,)))
-    init_addr = tl.cast(l1_token, tl.int64)
-    tle_raw.call(
-        d8_tma1d_edsl, [stage0, state0, init_addr, d8_bytes, inactive, init_op]
-    )
-    tle_raw.call(
-        d8_tma1d_edsl, [stage1, state1, init_addr, d8_bytes, inactive, init_op]
-    )
-    dispatch_sync(USE_D8_TMA1D)
-    tle_raw.call(
-        d8_tma1d_edsl, [stage0, state0, init_addr, d8_bytes, inactive, fence_op]
-    )
-    tle_raw.call(
-        d8_tma1d_edsl, [stage1, state1, init_addr, d8_bytes, inactive, fence_op]
-    )
-    dispatch_sync(USE_D8_TMA1D)
-
-    token_idx = sm_idx
-    cur = -1
-    e_start = 0
-    e_end = 0
-    pool_blk = 0
-    done = 0
-    next_slot = 0
-    pending = 0
-    pending_stage = stage0
-    pending_state = state0
-    pending_dst = init_addr
-    pending_pt = 0
-    pending_rank = 0
-    pending_src_tok = 0
-    pending_src_topk = 0
-    pending_pool = 0
-    pending_tie = 0
-
-    # The final iteration has live=0 and drains the last pending store.
-    while (done == 0) | (pending != 0):
-        (
-            cur,
-            e_start,
-            e_end,
-            pool_blk,
-            done,
-            live,
-            tok_in_e,
-            src_rank,
-            stt,
-            src_tok,
-            src_topk,
-            pt,
-        ) = _resolve_one_d8_route(
-            token_idx,
-            cur,
-            e_start,
-            e_end,
-            pool_blk,
-            done,
-            rsum_l,
-            recv_l,
-            q_l,
-            NPES,
-            EPR,
-            R_POW2,
-            MAX_RECV,
-            BLOCK_M,
-            TOPK,
-        )
-
-        stage = tl.where(next_slot == 0, stage0, stage1)
-        state = tl.where(next_slot == 0, state0, state1)
-        peer_base = _select_d8_peer(src_rank, tp0, tp1, tp2, tp3, tp4, tp5, tp6, tp7)
-        peer_tok = tl.multiple_of(peer_base.to(tl.pointer_type(tl.float8e4nv)), 16)
-        src_addr = tl.cast(peer_tok + src_tok * K, tl.int64)
-        active = tl.where(live, 1, 0)
-
-        # Enqueue current slot before waiting/storing the previous slot.
-        tle_raw.call(d8_tma1d_edsl, [stage, state, src_addr, d8_bytes, active, load_op])
-        dispatch_sync(USE_D8_TMA1D)
-        sfv = tl.load(
-            peer_f32(sf_tab, src_rank) + src_tok * NSF + offs_sf,
-            mask=live & sf_ok,
-            other=0.0,
-        )
-        tl.store(l1_sf + offs_sf * POOL_TOKENS + pt, sfv, mask=live & sf_ok)
-        weight = tl.load(peer_f32(w_tab, src_rank) + stt, mask=live, other=0.0)
-        tl.store(l1_w + pt, weight, mask=live)
-        dispatch_sync(USE_D8_TMA1D)
-
-        # Always execute the raw call and role barrier; `pending` is a PTX
-        # predicate so there is no branch-scoped WS barrier/hang hazard.
-        tle_raw.call(
-            d8_tma1d_edsl,
-            [pending_stage, pending_state, pending_dst, d8_bytes, pending, store_op],
-        )
-        dispatch_sync(USE_D8_TMA1D)
-        tl.store(meta_l + pending_pt * 3 + 0, pending_rank, mask=pending != 0)
-        tl.store(meta_l + pending_pt * 3 + 1, pending_src_tok, mask=pending != 0)
-        tl.store(meta_l + pending_pt * 3 + 2, pending_src_topk, mask=pending != 0)
-        tl.atomic_add(
-            l1_arrival_count + (pending_pool + pending_tie // BLOCK_M),
-            1,
-            mask=pending != 0,
-            sem="release",
-        )
-
-        pending = active
-        pending_stage = stage
-        pending_state = state
-        pending_dst = tl.cast(l1_token + pt * K, tl.int64)
-        pending_pt = pt
-        pending_rank = src_rank
-        pending_src_tok = src_tok
-        pending_src_topk = src_topk
-        pending_pool = pool_blk
-        pending_tie = tok_in_e
-        next_slot = tl.where(live, next_slot ^ 1, next_slot)
-        token_idx = tl.where(live, token_idx + NUM_SMS, token_idx)
-
-
-# ---------------------------------------------------------------------------
-# ROLE: dispatch (worker partition)
-# ---------------------------------------------------------------------------
-@triton.jit
-def dispatch_role(
-    topk_local,
-    tok_tab,
-    sf_tab,
-    w_tab,
-    q_tab,
-    recv_tab,
-    rsum_tab,
-    sig_tab,
-    meta_tab,
-    sm_expert_count,
-    expert_send_count,
-    l1_arrival_count,
-    gctr,
-    meta_ready,
-    l1_token,
-    l1_sf,
-    l1_w,
-    d8_token_s,
-    d8_state_s,
-    tp0,
-    tp1,
-    tp2,
-    tp3,
-    tp4,
-    tp5,
-    tp6,
-    tp7,  # v21: NPES peer token bases as kernel-arg ints
-    MY_PE: tl.constexpr,
-    NPES: tl.constexpr,
-    NUM_SMS: tl.constexpr,
-    NTOK: tl.constexpr,
-    TOPK: tl.constexpr,
-    NEXP: tl.constexpr,
-    EPR: tl.constexpr,
-    EPR_POW2: tl.constexpr,
-    R_POW2: tl.constexpr,
-    MAX_RECV: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    K: tl.constexpr,
-    NSF: tl.constexpr,
-    POOL_TOKENS: tl.constexpr,
-    BLOCK_R: tl.constexpr,
-    ITERS: tl.constexpr,
-    NEXP_POW2: tl.constexpr,
-    K_POW2: tl.constexpr,
-    NSF_POW2: tl.constexpr,
-    USE_D8_TMA1D: tl.constexpr,
-    USE_SMEM_EXPERT_COUNT: tl.constexpr,
-    FAST_NVLINK_BARRIER: tl.constexpr,
-    D8_PULL_STREAMS: tl.constexpr,
-):
-    sm_idx = tl.program_id(0)
-    routes = NTOK * TOPK
-    offs_e = tl.arange(0, NEXP_POW2)
-    e_ok = offs_e < NEXP
-    ec_row = sm_expert_count + sm_idx * NEXP
-
-    if USE_SMEM_EXPERT_COUNT:
-        # v12 parity: D1 and D3 share one CTA-local expert-count table, exactly
-        # like CUDA's smem_expert_count + atomicAdd_block path.  Keep the
-        # global table as the control path so this remains a one-switch A/B.
-        ec_s = tle.gpu.alloc(
-            [NEXP_POW2],
-            dtype=tl.int32,
-            layout=None,
-            scope=tle.gpu.smem,
-            nv_mma_shared_layout=False,
-        )
-        ec_vec = tle.gpu.local_ptr(ec_s, (offs_e,))
-        tl.store(ec_vec, tl.zeros((NEXP_POW2,), dtype=tl.int32))
-    else:
-        tl.store(ec_row + offs_e, tl.zeros((NEXP_POW2,), dtype=tl.int32), mask=e_ok)
-    dispatch_sync(USE_D8_TMA1D)
-
-    for it in tl.static_range(0, ITERS):  # D1 count
-        r = (it * NUM_SMS + sm_idx) * BLOCK_R + tl.arange(0, BLOCK_R)
-        m = r < routes
-        e = tl.load(topk_local + r, mask=m, other=-1).to(tl.int32)
-        ok1 = m & (e >= 0)
-        if USE_SMEM_EXPERT_COUNT:
-            tl.atomic_add(
-                tle.gpu.local_ptr(ec_s, (tl.where(ok1, e, 0),)),
-                1,
-                mask=ok1,
-                sem="relaxed",
-                scope="cta",
-            )
-        else:
-            tl.atomic_add(ec_row + e, 1, mask=ok1, sem="relaxed")
-    dispatch_sync(USE_D8_TMA1D)
-
-    if USE_SMEM_EXPERT_COUNT:
-        cnt = tl.load(ec_vec)
-    else:
-        cnt = tl.load(ec_row + offs_e, mask=e_ok, other=0)
-    send_value = (tl.full((NEXP_POW2,), 1, tl.int64) << 32) | cnt.to(tl.int64)
-    old = tl.atomic_add(
-        expert_send_count + offs_e, send_value, mask=e_ok, sem="relaxed"
-    )
-    if USE_SMEM_EXPERT_COUNT:
-        tl.store(ec_vec, (old & 0xFFFFFFFF).to(tl.int32))
-    else:
-        tl.store(ec_row + offs_e, (old & 0xFFFFFFFF).to(tl.int32), mask=e_ok)
-    dispatch_sync(USE_D8_TMA1D)
-
-    for it in tl.static_range(0, ITERS):  # D3 -> OWNER's queue
-        r = (it * NUM_SMS + sm_idx) * BLOCK_R + tl.arange(0, BLOCK_R)
-        m = r < routes
-        e = tl.load(topk_local + r, mask=m, other=-1).to(tl.int32)
-        valid = m & (e >= 0)
-        owner = tl.where(valid, e // EPR, 0)
-        local_e = tl.where(valid, e % EPR, 0)
-        if USE_SMEM_EXPERT_COUNT:
-            d3_slot = tl.atomic_add(
-                tle.gpu.local_ptr(ec_s, (tl.where(valid, e, 0),)),
-                1,
-                mask=valid,
-                sem="relaxed",
-                scope="cta",
-            )
-        else:
-            d3_slot = tl.atomic_add(ec_row + e, 1, mask=valid, sem="relaxed")
-        qb = peer_i32(q_tab, owner)  # VECTOR of peer bases
-        tl.store(qb + (local_e * NPES + MY_PE) * MAX_RECV + d3_slot, r, mask=valid)
-    dispatch_sync(USE_D8_TMA1D)
-
-    dispatch_rank_barrier(gctr + 0, NUM_SMS, USE_D8_TMA1D)  # comm::grid_sync
-
-    if sm_idx == 0:  # D4 -> every owner
-        d4_owner = tl.where(e_ok, offs_e // EPR, 0)
-        d4_le = tl.where(e_ok, offs_e % EPR, 0)
-        status = tl.load(expert_send_count + offs_e, mask=e_ok, other=0)
-        tl.store(
-            peer_i64(recv_tab, d4_owner) + (MY_PE * EPR + d4_le),
-            status & 0xFFFFFFFF,
-            mask=e_ok,
-        )
-        tl.atomic_add(
-            peer_i64(rsum_tab, d4_owner) + d4_le,
-            status,
-            mask=e_ok,
-            sem="relaxed",
-            scope="sys",
-        )
-
-    dispatch_nvlink_barrier(
-        sig_tab,
-        0,
-        gctr + 1,
-        sm_idx,
-        MY_PE,
-        NPES,
-        NUM_SMS,
-        USE_D8_TMA1D,
-        FAST_NVLINK_BARRIER,
-    )
-    tl.atomic_add(meta_ready + sm_idx, 1, sem="release")
-
-    # ---- D6..D9: pull tokens for MY experts from every source rank ----
-    rank_v = tl.arange(0, R_POW2)
-    rank_ok = rank_v < NPES
-    offs_h = tl.arange(0, K_POW2)
-    h_ok = offs_h < K
-    offs_sf = tl.arange(0, NSF_POW2)
-    sf_ok = offs_sf < NSF
-    rsum_l = peer_i64(rsum_tab, MY_PE)
-    recv_l = peer_i64(recv_tab, MY_PE)
-    q_l = peer_i32(q_tab, MY_PE)
-    meta_l = peer_i32(meta_tab, MY_PE)
-
-    if D8_PULL_STREAMS == 2:
-        dispatch_d8_pingpong_pull(
-            sf_tab,
-            w_tab,
-            rsum_l,
-            recv_l,
-            q_l,
-            meta_l,
-            l1_arrival_count,
-            l1_token,
-            l1_sf,
-            l1_w,
-            d8_token_s,
-            d8_state_s,
-            tp0,
-            tp1,
-            tp2,
-            tp3,
-            tp4,
-            tp5,
-            tp6,
-            tp7,
-            MY_PE,
-            NPES,
-            NUM_SMS,
-            EPR,
-            R_POW2,
-            MAX_RECV,
-            BLOCK_M,
-            K,
-            NSF,
-            POOL_TOKENS,
-            TOPK,
-            NSF_POW2,
-            USE_D8_TMA1D,
-        )
-
-    # Keep the single-stream loop's symbols defined even when its runtime loop
-    # is constexpr-disabled below; Triton's AST resolver visits that body
-    # before dead-code elimination.
-    inactive = tl.full((), 0, tl.int32)
-    d8_bytes = tl.full((), K, tl.int32)
-    d8_init_op = tl.full((), 0, tl.int32)
-    d8_load_op = tl.full((), 1, tl.int32)
-    d8_store_op = tl.full((), 2, tl.int32)
-    d8_fence_op = tl.full((), 3, tl.int32)
-    d8_stage_addr = smem_generic_addr(tle.gpu.local_ptr(d8_token_s, (0,)))
-    d8_state_addr = smem_generic_addr(tle.gpu.local_ptr(d8_state_s, (0,)))
-    d8_init_addr = tl.cast(l1_token, tl.int64)
-
-    if (USE_D8_TMA1D > 0) & (D8_PULL_STREAMS == 1):
-        # The raw owner initializes one mbarrier for the whole dispatch role.
-        # TLE's role-scoped barrier has a 128-thread count, unlike the old
-        # helper's CTA-wide __syncthreads which deadlocked under WS.
-        tle_raw.call(
-            d8_tma1d_edsl,
-            [
-                d8_stage_addr,
-                d8_state_addr,
-                d8_init_addr,
-                d8_bytes,
-                inactive,
-                d8_init_op,
-            ],
-        )
-        dispatch_sync(USE_D8_TMA1D)
-        tle_raw.call(
-            d8_tma1d_edsl,
-            [
-                d8_stage_addr,
-                d8_state_addr,
-                d8_init_addr,
-                d8_bytes,
-                inactive,
-                d8_fence_op,
-            ],
-        )
-        dispatch_sync(USE_D8_TMA1D)
-
-    token_idx = sm_idx
-    cur = -1
-    e_start = 0
-    e_end = 0
-    pool_blk = 0
-    done = D8_PULL_STREAMS - 1
-    while done == 0:
-        while (done == 0) & (token_idx >= e_end):  # D6 expert cursor
-            cur += 1
-            ex = cur >= EPR
-            done = tl.where(ex, 1, 0)
-            safe_cur = tl.where(ex, 0, cur)
-            n = (tl.load(rsum_l + safe_cur) & 0xFFFFFFFF).to(tl.int32)
-            add_blk = (e_end - e_start + BLOCK_M - 1) // BLOCK_M
-            pool_blk = tl.where(ex, pool_blk, pool_blk + add_blk)
-            e_start = tl.where(ex, e_start, e_end)
-            e_end = tl.where(ex, e_end, e_end + n)
-
-        live = done == 0
-        safe_e = tl.where(live, cur, 0)
-        tok_in_e = tl.where(live, token_idx - e_start, 0)
-
-        remaining = tl.where(
-            rank_ok & live,  # D7 round-robin
-            tl.load(recv_l + rank_v * EPR + safe_e, mask=rank_ok, other=0).to(tl.int32),
-            0,
-        )
-        slot = tok_in_e
-        offset = 0
-        src_rank = 0
-        tir = 0
-        found = 0
-        while found == 0:
-            active = remaining > 0
-            num_active = tl.sum(active.to(tl.int32), axis=0)
-            length = tl.min(tl.where(active, remaining, 0x7FFFFFFF), axis=0)
-            nrt = length * num_active
-            hit = (slot < nrt) | (num_active == 0)
-            denom = tl.maximum(num_active, 1)
-            sir = slot % denom
-            order = tl.cumsum(active.to(tl.int32), axis=0) - 1
-            sel = active & (order == sir)
-            src_rank = tl.where(hit, tl.sum(tl.where(sel, rank_v, 0), axis=0), src_rank)
-            tir = tl.where(hit, offset + slot // denom, tir)
-            slot = tl.where(hit, slot, slot - nrt)
-            offset = tl.where(hit, offset, offset + length)
-            remaining = tl.where(
-                hit, remaining, remaining - tl.minimum(remaining, length)
-            )
-            found = tl.where(hit, 1, 0)
-
-        q_off = tl.where(live, (safe_e * NPES + src_rank) * MAX_RECV + tir, 0)
-        stt = tl.load(q_l + q_off, mask=live, other=0)
-        src_tok = stt // TOPK
-        src_topk = stt % TOPK
-        pt = tl.where(live, pool_blk * BLOCK_M + tok_in_e, 0)
-
-        # D8: REMOTE pull over NVLink (CUDA: tma_load_1d on the peer pointer)
-        # v21: select the peer base among the NPES kernel-arg pointers (tp0..tp7, all
-        # divisibility=16 via int-arg specialization). src_rank is a uniform scalar, so
-        # the where-chain resolves to one div=16 base -> the fp8 row coalesces into wide
-        # LDG (was per-byte LDG.E.U8 = 16x sectors when the base came from a table load).
-        _tb = tp0
-        _tb = tl.where(src_rank == 1, tp1, _tb)
-        _tb = tl.where(src_rank == 2, tp2, _tb)
-        _tb = tl.where(src_rank == 3, tp3, _tb)
-        _tb = tl.where(src_rank == 4, tp4, _tb)
-        _tb = tl.where(src_rank == 5, tp5, _tb)
-        _tb = tl.where(src_rank == 6, tp6, _tb)
-        _tb = tl.where(src_rank == 7, tp7, _tb)
-        _ptok = tl.multiple_of(_tb.to(tl.pointer_type(tl.float8e4nv)), 16)
-        src_token = _ptok + src_tok * K
-        dst_token = l1_token + pt * K
-        if USE_D8_TMA1D > 1:
-            active = tl.where(live, 1, 0)
-            src_token_addr = tl.cast(src_token, tl.int64)
-            # BEGIN only enqueues peer GMEM -> SMEM. The TMA transfer overlaps
-            # the unchanged ordinary SF/top-k traffic below.
-            tle_raw.call(
-                d8_tma1d_edsl,
-                [
-                    d8_stage_addr,
-                    d8_state_addr,
-                    src_token_addr,
-                    d8_bytes,
-                    active,
-                    d8_load_op,
-                ],
-            )
-            dispatch_sync(USE_D8_TMA1D)
-        else:
-            x = tl.load(src_token + offs_h, mask=live & h_ok)
-            tl.store(dst_token + offs_h, x, mask=live & h_ok)
-        sfv = tl.load(
-            peer_f32(sf_tab, src_rank) + src_tok * NSF + offs_sf,
-            mask=live & sf_ok,
-            other=0.0,
-        )
-        tl.store(l1_sf + offs_sf * POOL_TOKENS + pt, sfv, mask=live & sf_ok)
-        w = tl.load(peer_f32(w_tab, src_rank) + stt, mask=live, other=0.0)
-        tl.store(l1_w + pt, w, mask=live)
-        if USE_D8_TMA1D > 1:
-            dispatch_sync(USE_D8_TMA1D)
-            # FINISH waits for the load, copies SMEM -> local L1, and waits for
-            # the store before D9 metadata and release arrival become visible.
-            dst_token_addr = tl.cast(dst_token, tl.int64)
-            tle_raw.call(
-                d8_tma1d_edsl,
-                [
-                    d8_stage_addr,
-                    d8_state_addr,
-                    dst_token_addr,
-                    d8_bytes,
-                    active,
-                    d8_store_op,
-                ],
-            )
-            dispatch_sync(USE_D8_TMA1D)
-
-        tl.store(meta_l + pt * 3 + 0, src_rank, mask=live)  # D9
-        tl.store(meta_l + pt * 3 + 1, src_tok, mask=live)
-        tl.store(meta_l + pt * 3 + 2, src_topk, mask=live)
-        tl.atomic_add(
-            l1_arrival_count + (pool_blk + tok_in_e // BLOCK_M),
-            1,
-            mask=live,
-            sem="release",
-        )
-        token_idx = tl.where(live, token_idx + NUM_SMS, token_idx)
 
 
 # ---------------------------------------------------------------------------
@@ -1668,7 +336,6 @@ def loader_role(
     b2_desc,
     sfa1_desc,
     sfa2_desc,
-    loader_blocks,
     LOAD_A: tl.constexpr,
     MY_PE: tl.constexpr,
     NUM_SMS: tl.constexpr,
@@ -1707,7 +374,6 @@ def loader_role(
     wave_pool_prefix = 0
     phase = 1
     ck = 0
-    nblocks = 0
     stop = 0
     while stop == 0:
         got = 0
@@ -1833,10 +499,6 @@ def loader_role(
                         )
                     writer.commit(ck)
                     ck += 1
-            nblocks += 1
-    # Count one producer only so the host coverage check is unchanged.
-    if LOAD_A:
-        tl.store(loader_blocks + sm_idx, nblocks)
 
 
 # ---------------------------------------------------------------------------
@@ -1854,19 +516,16 @@ def math_role(
     cb_tab,
     sig_tab,
     meta_tab,
-    l2out_tab,
     cb_local,
     l1_w,
     l2_acts,
     l2_sf,
     l2_arrival_mask,
-    math_blocks,
     topk_local,
     final_y,
     gctr,
     w1_sf,
     w2_sf,
-    WRITE_L2_OUT: tl.constexpr,
     USE_L2_TMA: tl.constexpr,
     WG: tl.constexpr,
     USE_L1_STORE_PIPE: tl.constexpr,
@@ -1931,13 +590,11 @@ def math_role(
     # accumulator index (cuh:1016).
     _is_up = ((offs_n // 8) % 2) == 1
     meta_l = peer_i32(meta_tab, MY_PE)
-    l2o_l = peer_f32(l2out_tab, MY_PE)
 
     block_idx = sm_idx
     cur_e = 0
     phase = 1
     ck = 0
-    nblocks = 0
     stop = 0
     while stop == 0:
         got = 0
@@ -2237,17 +894,6 @@ def math_role(
             else:
                 if do_epilogue:
                     # L2 EPILOGUE: BF16 cast + NVLink scatter to the SOURCE rank
-                    cols = n_block * BLOCK_N + offs_n
-                    # v5: this fp32 local copy is TEST-ONLY (see module docstring) -- the
-                    # kernel never reads it back; only the host-side d2h correctness check
-                    # does. CUDA has no equivalent. Skip it when benchmarking: it is a full
-                    # [BLOCK_M, BLOCK_N] fp32 store, i.e. 2x the bytes of the bf16 scatter.
-                    if WRITE_L2_OUT:
-                        tl.store(
-                            l2o_l + rows[:, None] * L2_N + cols[None, :],
-                            acc,
-                            mask=m_ok[:, None],
-                        )
                     md = meta_l + rows * 3
                     dst_rank = tl.load(md + 0, mask=m_ok, other=0)
                     dst_tok = tl.load(md + 1, mask=m_ok, other=0)
@@ -2284,8 +930,6 @@ def math_role(
                             l2_wide_scatter_edsl,
                             [cd_addr, dst_addr, valid_m_wg, scatter_cols, bar_wg],
                         )
-            nblocks += 1
-    tl.store(math_blocks + sm_idx, nblocks)
 
     # v31: only WG0 runs the cross-rank barrier + combine (per-token, tiny).
     if WG == 0:
@@ -2668,7 +1312,6 @@ def ws_megakernel(
     sig_tab,
     meta_tab,
     cb_tab,
-    l2out_tab,
     cb_local,
     sm_expert_count,
     expert_send_count,
@@ -2683,8 +1326,6 @@ def ws_megakernel(
     l2_sf,
     w1_sf,
     w2_sf,
-    loader_blocks,
-    math_blocks,
     final_y,
     a1_desc,
     b1_desc,
@@ -2701,7 +1342,6 @@ def ws_megakernel(
     tp6,
     tp7,
     l1_st_desc,
-    WRITE_L2_OUT: tl.constexpr,
     USE_L2_TMA: tl.constexpr,
     USE_D8_TMA1D: tl.constexpr,
     USE_L1_STORE_PIPE: tl.constexpr,
@@ -2838,19 +1478,16 @@ def ws_megakernel(
                     cb_tab,
                     sig_tab,
                     meta_tab,
-                    l2out_tab,
                     cb_local,
                     l1_w,
                     l2_acts,
                     l2_sf,
                     l2_arrival_mask,
-                    math_blocks,
                     topk_local,
                     final_y,
                     gctr,
                     w1_sf,
                     w2_sf,
-                    WRITE_L2_OUT,
                     USE_L2_TMA,
                     0,
                     USE_L1_STORE_PIPE,
@@ -2894,19 +1531,16 @@ def ws_megakernel(
                     cb_tab,
                     sig_tab,
                     meta_tab,
-                    l2out_tab,
                     cb_local,
                     l1_w,
                     l2_acts,
                     l2_sf,
                     l2_arrival_mask,
-                    math_blocks,
                     topk_local,
                     final_y,
                     gctr,
                     w1_sf,
                     w2_sf,
-                    WRITE_L2_OUT,
                     USE_L2_TMA,
                     1,
                     USE_L1_STORE_PIPE,
@@ -3001,7 +1635,6 @@ def ws_megakernel(
                     b2_desc,
                     sfa1_desc,
                     sfa2_desc,
-                    loader_blocks,
                     True,
                     MY_PE,
                     NUM_SMS,
@@ -3033,7 +1666,6 @@ def ws_megakernel(
                     b2_desc,
                     sfa1_desc,
                     sfa2_desc,
-                    loader_blocks,
                     False,
                     MY_PE,
                     NUM_SMS,
@@ -3056,21 +1688,6 @@ def ws_megakernel(
         [MATH_WARPS, 2, 1, 1],
         [224, 48, 48, 48],
     )
-
-
-def rr_select(counts_per_rank, slot):
-    remaining = list(counts_per_rank)
-    offset = 0
-    while True:
-        active = [i for i, v in enumerate(remaining) if v > 0]
-        length = min(remaining[i] for i in active)
-        na = len(active)
-        nrt = length * na
-        if slot < nrt:
-            return active[slot % na], offset + slot // na
-        slot -= nrt
-        offset += length
-        remaining = [v - min(v, length) for v in remaining]
 
 
 def run_worker(config: MegaMoEConfig) -> int:
@@ -3113,6 +1730,11 @@ def run_worker(config: MegaMoEConfig) -> int:
     NEXP = config.num_experts
     K = config.hidden_size
     INTER_ENV = config.intermediate_size
+    assert NUM_SMS > 0
+    assert NTOK > 0
+    assert 0 < TOPK <= NEXP
+    assert K > 0 and K % 128 == 0
+    assert INTER_ENV > 0 and INTER_ENV % 128 == 0
     NL1N = INTER_ENV // 64
     BENCH = int(config.benchmark)
     # Immutable adopted choices; command-line options cannot change version semantics.
@@ -3132,18 +1754,14 @@ def run_worker(config: MegaMoEConfig) -> int:
         128,
     )  # v31: BM128 tile, split across 2 math WGs
     STAGES = config.stages
+    assert STAGES > 0
     if USE_D8_TMA1D:
-        assert (
-            0 < K <= 4096 and K % 16 == 0
-        ), f"raw D8 TMA1D requires 16-byte token rows with K<=4096, got K={K}"
+        assert K <= 4096, f"raw D8 TMA1D requires K<=4096, got K={K}"
     assert D8_PULL_STREAMS in (1, 2), D8_PULL_STREAMS
     assert (
         D8_PULL_STREAMS == 1 or USE_D8_TMA1D > 1
     ), "two D8 pull streams require the full raw TMA1D load+store path"
-    if R != config.num_ranks:
-        raise ValueError(
-            f"NVSHMEM initialized {R} ranks, but --num-ranks={config.num_ranks}"
-        )
+    assert R == config.num_ranks
     assert NEXP % R == 0, f"NEXP={NEXP} must be divisible by npes={R}"
     EPR = NEXP // R
     # v172: UserHopper's MoE-7 heuristic schedules eight experts per wave.
@@ -3158,6 +1776,7 @@ def run_worker(config: MegaMoEConfig) -> int:
     NPAIR = BLOCK_N // 16
     NSF = K // 128
     MAX_RECV = config.max_recv
+    assert MAX_RECV > 0
     # Dispatch route tile.  Keep the historical default for old versions, but
     # expose it so newer experiments can match the two-warp CUDA frontend
     # (one route per lane, i.e. 2 * 32 routes per CTA).
@@ -3176,19 +1795,12 @@ def run_worker(config: MegaMoEConfig) -> int:
     # activations, scales, routing and checkpoint FP8 expert weights.  The
     # random path remains available for regression runs.
     DROP = config.drop_rate
-    data_label = "random"
     if config.data_dir is not None:
         dataset = load_qwen3_rank_data(
             config.data_dir,
             rank=rank,
-            num_ranks=R,
             num_tokens=NTOK,
-            hidden=K,
-            intermediate=INTER,
-            num_experts=NEXP,
-            topk=TOPK,
             torch=torch,
-            verify_sha256=config.verify_data_sha256,
         )
         shared, local = dataset["shared"], dataset["local"]
         topk_all = shared["topk_idx"].reshape(R, routes).contiguous()
@@ -3205,10 +1817,6 @@ def run_worker(config: MegaMoEConfig) -> int:
         w1_sf = local["l1_weight_scale_inv"].to(dev).contiguous()
         w2_q = fp8_from_uint8(local["l2_weight_fp8_bits"], torch).to(dev)
         w2_sf = local["l2_weight_scale_inv"].to(dev).contiguous()
-        data_label = (
-            f"{dataset['manifest']['source_model']}@{dataset['manifest']['source_revision']}"
-            f":layer{dataset['manifest']['layer']}"
-        )
     else:
         g = torch.Generator(device="cpu").manual_seed(1234)
         # Routing must match the baselines we compare against. `bench_mega_moe_sm90.py`
@@ -3233,54 +1841,37 @@ def run_worker(config: MegaMoEConfig) -> int:
         w2_sf = (
             torch.rand(EPR, NL2N, NK2, generator=gg, device=dev) * 0.4 + 0.3
         ).contiguous()
-    if tuple(w1_q.shape) != (EPR, L1_N, K):
-        raise ValueError(
-            f"invalid W1 weight shape {tuple(w1_q.shape)}; expected {(EPR, L1_N, K)}"
-        )
+    assert tuple(w1_q.shape) == (EPR, L1_N, K)
     # Match the checkpoint/UserHopper W1 SF contract exactly. CUDA stores ONE
     # scalar per (128-row weight block, 128-K block); with the gate/up gran-8
     # interleave a BLOCK_N=128 tile spans 64 gate cols + 64 up cols that all
     # share their block's scalar.  The checkpoint layout is [E, NL1N, NK1]:
     # the first NL1N/2 rows are gate SF and the second NL1N/2 rows are up SF.
     # Therefore gate_sf_n=n_block/2 and up_sf_n=NL1N/2+n_block/2.
-    if tuple(w1_sf.shape) != (EPR, NL1N, NK1):
-        raise ValueError(
-            f"invalid W1 SF shape {tuple(w1_sf.shape)}; expected {(EPR, NL1N, NK1)}"
-        )
+    assert tuple(w1_sf.shape) == (EPR, NL1N, NK1)
     # v7: L2 is one scalar per (BLOCK_N, BLOCK_K) tile -- cuh:927.
 
-    # ---- CPU model of the EP layout (same on every rank) ----
+    # The host computes only the workspace size. Dispatch and expert scheduling
+    # remain inside the persistent kernel.
     tk = topk_all.tolist()
-    q_ref = [[[[] for _ in range(R)] for _ in range(EPR)] for _ in range(R)]
+    counts = [[[0 for _ in range(R)] for _ in range(EPR)] for _ in range(R)]
     for src in range(R):
-        for r_, e in enumerate(tk[src]):
+        for e in tk[src]:
             if e >= 0:
-                q_ref[e // EPR][e % EPR][src].append(r_)
-    counts = [
-        [[len(q_ref[o][le][s]) for s in range(R)] for le in range(EPR)]
-        for o in range(R)
-    ]
+                counts[e // EPR][e % EPR][src] += 1
     peak_recv = max(
         counts[o][le][src] for o in range(R) for le in range(EPR) for src in range(R)
     )
-    if peak_recv > MAX_RECV:
-        raise ValueError(
-            f"real routes/source/expert={peak_recv} exceed MAX_RECV={MAX_RECV}"
-        )
-    if rank == 0:
-        print(f"QUEUE_CAPACITY max_recv={MAX_RECV} peak_routes={peak_recv}", flush=True)
+    assert peak_recv <= MAX_RECV
     n_le = [[sum(counts[o][le]) for le in range(EPR)] for o in range(R)]
     blocks = [[(n + BLOCK_M - 1) // BLOCK_M for n in n_le[o]] for o in range(R)]
-    pool_off = [[sum(blocks[o][:le]) for le in range(EPR)] for o in range(R)]
     NPB = max(sum(blocks[o]) for o in range(R))
     POOL_TOKENS = max(NPB * BLOCK_M, BLOCK_M)
-    EXPECT = sum(blocks[rank]) * (NL1N + NL2N)
 
     # ---- symmetric heap ----
     def sym(nbytes):
         p = lib.nvshmem_alloc_bytes_wrapper(int(nbytes))
-        if not p:
-            raise RuntimeError("nvshmem_malloc failed")
+        assert p
         return p
 
     tok_b = sym(NTOK * K)
@@ -3292,7 +1883,6 @@ def run_worker(config: MegaMoEConfig) -> int:
     cb_b = sym(TOPK * NTOK * K * 2)
     sig_b = sym(16 * 4)
     meta_b = sym(POOL_TOKENS * 3 * 4)
-    l2out_b = sym(POOL_TOKENS * L2_N * 4)
 
     def peers(base):
         vals = []
@@ -3302,19 +1892,13 @@ def run_worker(config: MegaMoEConfig) -> int:
                 if pe == rank
                 else lib.nvshmem_ptr_wrapper(ctypes.c_void_p(base), pe)
             )
-            if not p:
-                raise RuntimeError(f"nvshmem_ptr NULL for pe={pe}; no NVLink P2P?")
+            assert p
             vals.append(int(p))
         return torch.tensor(vals, device=dev, dtype=torch.int64)
 
     tok_tab, sf_tab, w_tab = peers(tok_b), peers(sf_b), peers(w_b)
     q_tab, recv_tab, rsum_tab = peers(q_b), peers(recv_b), peers(rsum_b)
-    cb_tab, sig_tab, meta_tab, l2out_tab = (
-        peers(cb_b),
-        peers(sig_b),
-        peers(meta_b),
-        peers(l2out_b),
-    )
+    cb_tab, sig_tab, meta_tab = peers(cb_b), peers(sig_b), peers(meta_b)
 
     BLK = 1024
 
@@ -3325,11 +1909,6 @@ def run_worker(config: MegaMoEConfig) -> int:
         b = t.contiguous().view(-1).view(torch.int8).to(dev)
         sym_h2d[(triton.cdiv(b.numel(), BLK),)](b, tab, rank, b.numel(), BLOCK=BLK)
 
-    def d2h(tab, pe, nb):
-        out = torch.empty(nb, device=dev, dtype=torch.int8)
-        sym_d2h[(triton.cdiv(nb, BLK),)](tab, pe, out, nb, BLOCK=BLK)
-        return out
-
     for tab, nb in (
         (q_tab, EPR * R * MAX_RECV * 4),
         (recv_tab, R * EPR * 8),
@@ -3337,7 +1916,6 @@ def run_worker(config: MegaMoEConfig) -> int:
         (cb_tab, TOPK * NTOK * K * 2),
         (sig_tab, 16 * 4),
         (meta_tab, POOL_TOKENS * 3 * 4),
-        (l2out_tab, POOL_TOKENS * L2_N * 4),
     ):
         zero(tab, nb)
     h2d(tok_all[rank], tok_tab)
@@ -3363,8 +1941,6 @@ def run_worker(config: MegaMoEConfig) -> int:
     l2_acts = torch.zeros((POOL_TOKENS, INTER), device=dev, dtype=f8)
     l2_sf = torch.zeros((NL1N * POOL_TOKENS,), device=dev, dtype=torch.float32)
     final_y = torch.zeros((NTOK, K), device=dev, dtype=torch.bfloat16)
-    loader_blocks = torch.zeros((NUM_SMS,), device=dev, dtype=torch.int32)
-    math_blocks = torch.zeros((NUM_SMS,), device=dev, dtype=torch.int32)
 
     def _alloc_fn(size: int, align: int, stream):
         return torch.empty(size, device=dev, dtype=torch.int8)
@@ -3453,7 +2029,6 @@ def run_worker(config: MegaMoEConfig) -> int:
         BLOCK_R=BLOCK_R,
         ITERS=ITERS,
         STAGES=STAGES,
-        WRITE_L2_OUT=(BENCH == 0),
         USE_L2_TMA=(USE_L2_TMA != 0),
         USE_L1_STORE_PIPE=(USE_L1_STORE_PIPE != 0),
         # Keep the integer diagnostic level: 0=live v23 control, 1=init-only,
@@ -3466,23 +2041,9 @@ def run_worker(config: MegaMoEConfig) -> int:
         MATH_WARPS=4,
         num_warps=LOADER_WARPS,
     )
-    kernel_arg_names = getattr(ws_megakernel, "arg_names", ())
-    if "EARLY_PIPE_RELEASE" in kernel_arg_names:
-        kargs["EARLY_PIPE_RELEASE"] = bool(
-            getattr(EARLY_PIPE_RELEASE, "value", EARLY_PIPE_RELEASE)
-        )
-    if "PARTICIPANT_PIPE_RELEASE" in kernel_arg_names:
-        kargs["PARTICIPANT_PIPE_RELEASE"] = PARTICIPANT_PIPE_RELEASE
-    if "LOADER_RSUM_EARLY" in kernel_arg_names:
-        kargs["LOADER_RSUM_EARLY"] = LOADER_RSUM_EARLY
     # v21: NPES peer token-buffer bases as direct int kernel-args (div=16 specialized
     # -> wide coalesced LDG), padded to 8; the where-chain in dispatch picks by src_rank.
     _tp = (tok_tab.tolist() + [int(tok_tab[0])] * 8)[:8]
-    if "sp0" in kernel_arg_names:
-        _sp = (sf_tab.tolist() + [int(sf_tab[0])] * 8)[:8]
-        _wp = (w_tab.tolist() + [int(w_tab[0])] * 8)[:8]
-        kargs.update({f"sp{i}": int(_sp[i]) for i in range(8)})
-        kargs.update({f"wp{i}": int(_wp[i]) for i in range(8)})
     pos = (
         topk_local,
         tok_tab,
@@ -3494,7 +2055,6 @@ def run_worker(config: MegaMoEConfig) -> int:
         sig_tab,
         meta_tab,
         cb_tab,
-        l2out_tab,
         cb_b,
         sm_ec,
         send,
@@ -3509,8 +2069,6 @@ def run_worker(config: MegaMoEConfig) -> int:
         l2_sf,
         w1_sf,
         w2_sf,
-        loader_blocks,
-        math_blocks,
         final_y,
         a1_desc,
         b1_desc,
@@ -3542,49 +2100,15 @@ def run_worker(config: MegaMoEConfig) -> int:
 
     reset()
     barrier()
-    try:
-        compiled = ws_megakernel[(NUM_SMS,)](*pos, **kargs)
-    except Exception as _e:
-        c = _e
-        while getattr(c, "__cause__", None) is not None:
-            c = c.__cause__
-        print(
-            "V31_FULLERR>>> "
-            + repr(c)[:300]
-            + " FILENAME="
-            + str(getattr(c, "filename", None))
-            + " args="
-            + str(getattr(c, "args", None)),
-            flush=True,
-        )
-        raise
+    ws_megakernel[(NUM_SMS,)](*pos, **kargs)
     barrier()
 
     bench_us = None
-    baseline_us = None
-    baseline_kernel = globals().get("BENCH_BASELINE_KERNEL") if BENCH else None
-    baseline_kargs = dict(kargs)
-    if baseline_kernel is not None:
-        baseline_kargs.update(globals().get("BENCH_BASELINE_KWARGS", {}))
-        baseline_arg_names = set(getattr(baseline_kernel, "arg_names", ()))
-        for _name in [
-            *(f"sp{i}" for i in range(8)),
-            *(f"wp{i}" for i in range(8)),
-            "MATH_PREFETCH_SFB",
-        ]:
-            if _name not in baseline_arg_names:
-                baseline_kargs.pop(_name, None)
-    if baseline_kernel is not None:
-        reset()
-        barrier()
-        baseline_kernel[(NUM_SMS,)](*pos, **baseline_kargs)
-        barrier()
 
     if BENCH:
         times = []
-        baseline_times = []
 
-        def timed_launch(kernel, launch_kargs):
+        def timed_launch():
             reset()
             barrier()
             e0, e1 = torch.cuda.Event(True), torch.cuda.Event(True)
@@ -3598,7 +2122,7 @@ def run_worker(config: MegaMoEConfig) -> int:
                     ctypes.c_void_p(torch.cuda.current_stream().cuda_stream)
                 )
             e0.record()
-            kernel[(NUM_SMS,)](*pos, **launch_kargs)
+            ws_megakernel[(NUM_SMS,)](*pos, **kargs)
             e1.record()
             torch.cuda.synchronize()
             elapsed = e0.elapsed_time(e1) * 1e3
@@ -3606,50 +2130,18 @@ def run_worker(config: MegaMoEConfig) -> int:
             return elapsed
 
         for i in range(BENCH_WARMUP + BENCH_ITERS):
-            if baseline_kernel is None:
-                candidate_elapsed = timed_launch(ws_megakernel, kargs)
-                baseline_elapsed = None
-            elif i & 1:
-                candidate_elapsed = timed_launch(ws_megakernel, kargs)
-                baseline_elapsed = timed_launch(baseline_kernel, baseline_kargs)
-            else:
-                baseline_elapsed = timed_launch(baseline_kernel, baseline_kargs)
-                candidate_elapsed = timed_launch(ws_megakernel, kargs)
+            candidate_elapsed = timed_launch()
             if i >= BENCH_WARMUP:
                 times.append(candidate_elapsed)
-                if baseline_elapsed is not None:
-                    baseline_times.append(baseline_elapsed)
         if BENCH_REDUCE == "mean":
             bench_us = sum(times) / len(times)
-            if baseline_times:
-                baseline_us = sum(baseline_times) / len(baseline_times)
         else:
             times.sort()
             bench_us = times[len(times) // 2]
-            if baseline_times:
-                baseline_times.sort()
-                baseline_us = baseline_times[len(baseline_times) // 2]
-
-    has_ws = "ttg.warp_specialize" in compiled.asm.get("ttgir", "")
-    n_tma = compiled.asm.get("ptx", "").count("cp.async.bulk.tensor")
 
     if BENCH:
-        P = sum(n_le[rank])
-        flops = 6.0 * P * K * INTER
-        tflops = flops / (bench_us * 1e-6) / 1e12
-        matched = ""
-        if baseline_us is not None:
-            speedup = baseline_us / bench_us
-            matched = f" paired_base={baseline_us:.1f}us " f"speedup={speedup:.4f}x"
         print(
-            f"[rank {rank}/{R}] BENCH h={K} ih={INTER} E={NEXP} k={TOPK} tokens={NTOK} "
-            f"recv={P} experts={EPR} | {bench_us:8.1f} us  {tflops:6.1f} TFLOPS  "
-            f"ws={has_ws} tma={n_tma} d8_tma1d_level={USE_D8_TMA1D} "
-            f"smem_ec={USE_SMEM_EXPERT_COUNT} fast_nvl={FAST_NVLINK_BARRIER} "
-            f"d8_streams={D8_PULL_STREAMS} reduce={BENCH_REDUCE} "
-            f"gpu_start_barrier={GPU_START_BARRIER} "
-            f"warmup={BENCH_WARMUP} iters={BENCH_ITERS} "
-            f"data={data_label}{matched}",
+            f"[rank {rank}/{R}] BENCH | {bench_us:.1f} us",
             flush=True,
         )
         lib.nvshmemx_barrier_wrapper(
@@ -3659,230 +2151,18 @@ def run_worker(config: MegaMoEConfig) -> int:
         lib.nvshmem_finalize_wrapper()
         return 0
 
-    # ---- readback ----
-    q_c = d2h(q_tab, rank, EPR * R * MAX_RECV * 4).cpu().view(torch.int32)
-    recv_c = d2h(recv_tab, rank, R * EPR * 8).cpu().view(torch.int64)
-    rsum_c = d2h(rsum_tab, rank, EPR * 8).cpu().view(torch.int64)
-    cb_c = (
-        d2h(cb_tab, rank, TOPK * NTOK * K * 2)
-        .cpu()
-        .view(torch.bfloat16)
-        .view(TOPK, NTOK, K)
-    )
-    peer_meta = [
-        d2h(meta_tab, pe, POOL_TOKENS * 3 * 4)
-        .cpu()
-        .view(torch.int32)
-        .view(POOL_TOKENS, 3)
-        for pe in range(R)
-    ]
-    peer_l2out = [
-        d2h(l2out_tab, pe, POOL_TOKENS * L2_N * 4)
-        .cpu()
-        .view(torch.float32)
-        .view(POOL_TOKENS, L2_N)
-        for pe in range(R)
-    ]
-    torch.cuda.synchronize()
-
-    inject = config.inject_fault
-    if inject == "queue":
-        q_c[0] = (int(q_c[0]) + 1) % (NTOK * TOPK)  # valid-but-wrong route
-    elif inject == "recv":
-        recv_c[0] += 1
-    elif inject == "meta":
-        peer_meta[rank][0, 0] = (int(peer_meta[rank][0, 0]) + 1) % R
-    errs = {}
-
-    def bump(k):
-        errs[k] = errs.get(k, 0) + 1
-
-    # D3: my queue holds exactly what each source sent me
-    for le in range(EPR):
-        for s in range(R):
-            base = (le * R + s) * MAX_RECV
-            got = sorted(
-                int(v) for v in q_c[base : base + counts[rank][le][s]].tolist()
-            )
-            if got != sorted(q_ref[rank][le][s]):
-                bump("queue")
-    # D4
-    for le in range(EPR):
-        for s in range(R):
-            if (int(recv_c[s * EPR + le]) & 0xFFFFFFFF) != counts[rank][le][s]:
-                bump("recv_count")
-        if (int(rsum_c[le]) & 0xFFFFFFFF) != n_le[rank][le]:
-            bump("recv_sum_low")
-        if ((int(rsum_c[le]) >> 32) & 0xFFFFFFFF) != NUM_SMS * R:
-            bump("recv_sum_high")
-
-    # pull: rr source selection, arrival, exact payload
-    meta_me = peer_meta[rank]
-    arr_c = arrival.cpu()
-    l1_tok_c = l1_tok.cpu()
-    l1_w_c = l1_w.cpu()
-    n_valid = 0
-    for le in range(EPR):
-        for t in range(n_le[rank][le]):
-            pt = pool_off[rank][le] * BLOCK_M + t
-            n_valid += 1
-            exp_src, exp_tir = rr_select(counts[rank][le], t)
-            gs, gt, gk = (int(meta_me[pt, 0]), int(meta_me[pt, 1]), int(meta_me[pt, 2]))
-            if gs != exp_src:
-                bump("rr_rank")
-                continue
-            stt = int(q_c[(le * R + exp_src) * MAX_RECV + exp_tir])
-            if stt // TOPK != gt or stt % TOPK != gk:
-                bump("meta")
-            if not torch.equal(l1_tok_c[pt], tok_all[gs, gt]):
-                bump("pull_token")
-            if abs(float(l1_w_c[pt]) - float(w_all[gs, stt])) > 0:
-                bump("pull_weight")
-        for b in range(blocks[rank][le]):
-            if int(arr_c[pool_off[rank][le] + b]) != min(
-                BLOCK_M, n_le[rank][le] - b * BLOCK_M
-            ):
-                bump("l1_arrival")
-
-    if (
-        int(loader_blocks.cpu().sum()) != EXPECT
-        or int(math_blocks.cpu().sum()) != EXPECT
-    ):
-        bump("block_coverage")
-
-    # L2 GEMM against a reference built from MY OWN l2_acts / l2_sf
-    deq = l2_acts.to(torch.float64).cpu()
-    sfg = l2_sf.view(NL1N, POOL_TOKENS).to(torch.float64).cpu()
-    for nb in range(NL1N):
-        deq[:, nb * L1_OUT_N : (nb + 1) * L1_OUT_N] *= sfg[nb][:, None]
-    W2loc = w2_q.to(torch.float64).cpu().clone()
-    # v7: w2_sf is now [EPR, NL2N, NK2] -- one scalar per (BLOCK_N, BLOCK_K)
-    # tile, so expand it over both the N block and the K block.
-    w2sf_c = w2_sf.to(torch.float64).cpu()  # [EPR, NL2N, NK2]
-    for nb in range(NL2N):
-        for kb in range(NK2):
-            W2loc[
-                :, nb * BLOCK_N : (nb + 1) * BLOCK_N, kb * BLOCK_K : (kb + 1) * BLOCK_K
-            ] *= w2sf_c[:, nb, kb][:, None, None]
-    l2o_me = peer_l2out[rank].to(torch.float64)
-    l2_err = 0.0
-    for le in range(EPR):
-        idx = [pool_off[rank][le] * BLOCK_M + t for t in range(n_le[rank][le])]
-        if not idx:
-            continue
-        ref = deq[idx] @ W2loc[le].T
-        sc = ref.abs().max().item()
-        l2_err = max(l2_err, (l2o_me[idx] - ref).abs().max().item() / max(sc, 1e-12))
-    if l2_err > 3e-3:  # async fp8 wgmma ~1-2e-4; bar << fp8 quant noise (3.5e-2)
-        bump("l2_gemm")
-
-    if inject == "scatter":
-        cb_c[0, 0, 0] = (cb_c[0, 0, 0].float() + 1.0).to(torch.bfloat16)
-    elif inject == "combine":
-        final_y[0, 0] = (final_y[0, 0].float() + 1.0).to(torch.bfloat16)
-
-    # CROSS-RANK SCATTER, exact: each of my (k,t) partials must equal the owner's
-    # l2_out at the pool row whose metadata says (src=me, tok=t, topk=k).
-    owner_index = []
-    for o in range(R):
-        d = {}
-        m = peer_meta[o]
-        for le in range(EPR):
-            for t in range(n_le[o][le]):
-                pt = pool_off[o][le] * BLOCK_M + t
-                d[(int(m[pt, 0]), int(m[pt, 1]), int(m[pt, 2]))] = pt
-        owner_index.append(d)
-
-    scatter_bad = 0
-    n_partials = 0
-    tk_me = topk_all[rank].view(NTOK, TOPK)
-    for t in range(NTOK):
-        for k in range(TOPK):
-            e = int(tk_me[t, k])
-            if e < 0:
-                continue
-            n_partials += 1
-            o = e // EPR
-            pt = owner_index[o].get((rank, t, k))
-            if pt is None:
-                scatter_bad += 1
-                continue
-            exp = peer_l2out[o][pt].to(torch.bfloat16)
-            if not torch.equal(cb_c[k, t], exp):
-                scatter_bad += 1
-    if scatter_bad:
-        bump("cross_rank_scatter")
-
-    # combine, exact
-    y_ref = torch.zeros(NTOK, K, dtype=torch.float32)
-    for k in range(TOPK):
-        sel = tk_me[:, k] >= 0
-        y_ref[sel] += cb_c[k][sel].to(torch.float32)
-    if int((final_y.cpu() != y_ref.to(torch.bfloat16)).sum()):
-        bump("combine")
-
-    ok = not errs and has_ws and n_tma > 0
-    print(
-        f"[rank {rank}/{R}] EPR={EPR} pool_tok={sum(n_le[rank])} blocks={sum(blocks[rank])} "
-        f"gemm_blocks={EXPECT} ws={has_ws} tma={n_tma} l2_gemm={l2_err:.2e} "
-        f"partials={n_partials} scatter_bad={scatter_bad} errors={errs or 0} "
-        f"d8_tma1d_level={USE_D8_TMA1D} data={data_label} "
-        f"-> {'PASS' if ok else 'FAIL'}",
-        flush=True,
-    )
-
     lib.nvshmemx_barrier_wrapper(
         ctypes.c_void_p(torch.cuda.current_stream().cuda_stream)
     )
     torch.cuda.synchronize()
     lib.nvshmem_finalize_wrapper()
-    return 0 if ok else 1
+    return 0
 
 
 def main(config: MegaMoEConfig = CONFIG) -> int:
     if config.worker:
         return run_worker(config)
-    env = os.environ.copy()
-    # This parent imported Triton before MPI assigned a rank, so its cache path
-    # necessarily ends in rank-0.  Do not leak that path to every worker:
-    # each worker must recompute TRITON_CACHE_DIR from OMPI_COMM_WORLD_RANK at
-    # import time or cold multi-rank compiles contend on one cache lock.
-    env.pop("TRITON_CACHE_DIR", None)
-    env.update(
-        {
-            "NVSHMEM_BOOTSTRAP": "MPI",
-            "CUDA_HOME": str(config.cuda_home),
-        }
-    )
-    cmd = [
-        config.mpirun,
-        "--allow-run-as-root",
-        "-np",
-        str(config.num_ranks),
-        sys.executable,
-        str(Path(__file__).resolve()),
-        *_worker_cli_args(config),
-    ]
-    try:
-        proc = subprocess.run(
-            cmd,
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=config.timeout,
-            env=env,
-        )
-    except subprocess.TimeoutExpired as exc:
-        print("TIMEOUT\nstdout:", (exc.stdout or "")[-2500:])
-        print("stderr:", (exc.stderr or "")[-2500:])
-        return 1
-    # Forward the workers' output whole: every rank's result line has to
-    # reach whatever is reading this launcher, and a tail cuts off the
-    # low-numbered ranks as soon as anything else writes to stdout.
-    print(proc.stdout, end="")
-    if proc.returncode != 0:
-        print("STDERR:", proc.stderr[-4000:])
-    return proc.returncode
+    return launch_megamoe_cli(config)
 
 
 if __name__ == "__main__":
