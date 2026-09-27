@@ -88,6 +88,7 @@ def load_qwen3_rank_data(
     num_experts: int,
     topk: int,
     torch,
+    verify_sha256: bool = False,
 ) -> dict[str, Any]:
     root_path = Path(root).expanduser().resolve()
     manifest_path = root_path / "manifest.json"
@@ -143,7 +144,7 @@ def load_qwen3_rank_data(
         if not path.is_file():
             raise FileNotFoundError(f"shared-data tensor file is missing: {path}")
 
-    if os.environ.get("MEGAMOE_DATA_VERIFY_SHA256", "0") == "1":
+    if verify_sha256:
         for path, entry in ((shared_path, shared_entry), (rank_path, rank_entry)):
             expected = entry.get("sha256")
             actual = _sha256(path)

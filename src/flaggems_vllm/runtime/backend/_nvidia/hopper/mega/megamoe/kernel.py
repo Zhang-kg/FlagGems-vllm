@@ -74,37 +74,171 @@ current TLE raw implementation.
 TEST-ONLY: `meta` and `l2_out` are also placed on the symmetric heap so each rank
 can read a peer's copy and check the cross-rank scatter EXACTLY.
 
-Run this file directly; set ``MEGAMOE_NP`` for the rank count.
+Run this file directly.  Runtime and shape configuration is expressed through
+command-line options; the parent launcher forwards the same options to every
+MPI worker.
 """
 
 from __future__ import annotations
 
+import argparse
 import ctypes
 import os
+import shutil
 import subprocess
 import sys
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 SUPPORT_DIR = Path(__file__).resolve().parent
-os.environ.setdefault("W_CACHE_TAG", "v234-v220-realdata-w1-layout")
-NUM_RANKS = int(os.environ.get("MEGAMOE_NP", "2"))
-# TLE_PYTHON_OVERRIDE: mpirun workers are spawned with THIS interpreter, not the one
-# that started the parent. Without an override, launching with a different venv
-# silently still runs the OLD triton in the workers (cost: a full fake verification).
-TLE_PYTHON = Path(os.environ.get("TLE_PYTHON_OVERRIDE", sys.executable))
 
-# MUST precede the triton import: ranks sharing one cache dir deadlock on its lock.
-rank_env = os.environ.get("OMPI_COMM_WORLD_RANK", os.environ.get("PMI_RANK", "0"))
-cache_tag = os.environ.get("W_CACHE_TAG", "bench")
-cache_root = Path(
-    os.environ.get("W_CACHE_ROOT", Path.home() / ".cache" / "flaggems_vllm" / "megamoe")
-)
-os.environ.setdefault(
-    "CUDA_VISIBLE_DEVICES", ",".join(str(i) for i in range(NUM_RANKS))
-)
-os.environ.setdefault(
-    "TRITON_CACHE_DIR", str(cache_root / f"tle-megamoe-{cache_tag}-rank-{rank_env}")
-)
+
+@dataclass(frozen=True)
+class MegaMoEConfig:
+    """Configuration shared by the launcher and every MPI worker."""
+
+    worker: bool = False
+    num_ranks: int = 2
+    tokens: int = 128
+    hidden_size: int = 256
+    intermediate_size: int = 128
+    num_experts: int = 16
+    topk: int = 4
+    stages: int = 2
+    num_sms: int = 0
+    max_recv: int = 512
+    drop_rate: float = 0.1
+    benchmark: bool = False
+    warmup: int = 5
+    iterations: int = 20
+    reduce: str = "median"
+    gpu_start_barrier: bool = False
+    data_dir: Path | None = None
+    verify_data_sha256: bool = False
+    inject_fault: str | None = None
+    mpirun: str = "/usr/bin/mpirun"
+    timeout: int = 600
+    cuda_home: Path | None = None
+    nvshmem_home: Path | None = None
+
+
+def _config_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Run the Hopper MegaMoE standalone launcher."
+    )
+    parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--num-ranks", type=int, default=2)
+    parser.add_argument("--tokens", type=int, default=128)
+    parser.add_argument("--hidden-size", type=int, default=256)
+    parser.add_argument("--intermediate-size", type=int, default=128)
+    parser.add_argument("--num-experts", type=int, default=16)
+    parser.add_argument("--topk", type=int, default=4)
+    parser.add_argument("--stages", type=int, default=2)
+    parser.add_argument("--num-sms", type=int, default=0)
+    parser.add_argument("--max-recv", type=int, default=512)
+    parser.add_argument("--drop-rate", type=float)
+    parser.add_argument("--benchmark", action="store_true")
+    parser.add_argument("--warmup", type=int, default=5)
+    parser.add_argument("--iterations", type=int, default=20)
+    parser.add_argument("--reduce", choices=("mean", "median"), default="median")
+    parser.add_argument("--gpu-start-barrier", action="store_true")
+    parser.add_argument("--data-dir", type=Path)
+    parser.add_argument("--verify-data-sha256", action="store_true")
+    parser.add_argument(
+        "--inject-fault",
+        choices=("queue", "recv", "meta", "scatter", "combine"),
+    )
+    parser.add_argument("--mpirun", default=shutil.which("mpirun") or "/usr/bin/mpirun")
+    parser.add_argument("--timeout", type=int, default=600)
+    parser.add_argument("--cuda-home", type=Path)
+    parser.add_argument("--nvshmem-home", type=Path)
+    return parser
+
+
+def _parse_config(argv: list[str] | None = None) -> MegaMoEConfig:
+    args = _config_parser().parse_args(argv)
+    if args.drop_rate is None:
+        args.drop_rate = 0.0 if args.data_dir is not None else 0.1
+    config = MegaMoEConfig(**vars(args))
+    if config.num_ranks <= 0:
+        raise ValueError("--num-ranks must be positive")
+    if config.tokens <= 0:
+        raise ValueError("--tokens must be positive")
+    if config.hidden_size <= 0 or config.hidden_size % 128:
+        raise ValueError("--hidden-size must be a positive multiple of 128")
+    if config.intermediate_size <= 0 or config.intermediate_size % 64:
+        raise ValueError("--intermediate-size must be a positive multiple of 64")
+    if config.num_experts <= 0 or config.num_experts % config.num_ranks:
+        raise ValueError("--num-experts must be positive and divisible by --num-ranks")
+    if not 0 < config.topk <= config.num_experts:
+        raise ValueError("--topk must be in [1, num_experts]")
+    if config.stages <= 0:
+        raise ValueError("--stages must be positive")
+    if config.num_sms < 0:
+        raise ValueError("--num-sms cannot be negative")
+    if config.max_recv <= 0:
+        raise ValueError("--max-recv must be positive")
+    if not 0.0 <= config.drop_rate < 1.0:
+        raise ValueError("--drop-rate must be in [0, 1)")
+    if config.warmup < 0 or config.iterations <= 0:
+        raise ValueError(
+            "--warmup cannot be negative and --iterations must be positive"
+        )
+    if config.timeout <= 0:
+        raise ValueError("--timeout must be positive")
+    if config.data_dir is not None and config.drop_rate != 0.0:
+        raise ValueError("--data-dir requires --drop-rate=0")
+    return config
+
+
+def _worker_cli_args(config: MegaMoEConfig) -> list[str]:
+    args = [
+        "--worker",
+        "--num-ranks",
+        str(config.num_ranks),
+        "--tokens",
+        str(config.tokens),
+        "--hidden-size",
+        str(config.hidden_size),
+        "--intermediate-size",
+        str(config.intermediate_size),
+        "--num-experts",
+        str(config.num_experts),
+        "--topk",
+        str(config.topk),
+        "--stages",
+        str(config.stages),
+        "--num-sms",
+        str(config.num_sms),
+        "--max-recv",
+        str(config.max_recv),
+        "--drop-rate",
+        str(config.drop_rate),
+        "--warmup",
+        str(config.warmup),
+        "--iterations",
+        str(config.iterations),
+        "--reduce",
+        config.reduce,
+    ]
+    if config.benchmark:
+        args.append("--benchmark")
+    if config.gpu_start_barrier:
+        args.append("--gpu-start-barrier")
+    if config.data_dir is not None:
+        args.extend(("--data-dir", str(config.data_dir)))
+    if config.verify_data_sha256:
+        args.append("--verify-data-sha256")
+    if config.inject_fault is not None:
+        args.extend(("--inject-fault", config.inject_fault))
+    if config.cuda_home is not None:
+        args.extend(("--cuda-home", str(config.cuda_home)))
+    if config.nvshmem_home is not None:
+        args.extend(("--nvshmem-home", str(config.nvshmem_home)))
+    return args
+
+
+CONFIG = _parse_config() if __name__ == "__main__" else MegaMoEConfig()
 
 if __package__:
     from .qwen3_fp8_shared_data import (  # noqa: E402
@@ -113,8 +247,10 @@ if __package__:
         load_qwen3_rank_data,
     )
     from .runtime import (  # noqa: E402
-        NVSHMEM_HOME,
         _compile_nvshmem_host_so,
+        _default_build_dir,
+        _find_cuda_home,
+        _find_nvshmem_home,
         _import_env,
     )
 else:
@@ -125,27 +261,42 @@ else:
         load_qwen3_rank_data,
     )
     from runtime import (  # noqa: E402
-        NVSHMEM_HOME,
         _compile_nvshmem_host_so,
+        _default_build_dir,
+        _find_cuda_home,
+        _find_nvshmem_home,
         _import_env,
     )
+
+# MUST precede the triton import: ranks sharing one cache dir deadlock on its lock.
+CACHE_ROOT = _default_build_dir()
+rank_env = os.environ.get("OMPI_COMM_WORLD_RANK", os.environ.get("PMI_RANK", "0"))
+os.environ.setdefault(
+    "TRITON_CACHE_DIR", str(CACHE_ROOT / f"tle-megamoe-v234-rank-{rank_env}")
+)
+
+CUDA_HOME = _find_cuda_home(CONFIG.cuda_home)
+NVSHMEM_HOME = _find_nvshmem_home(CONFIG.nvshmem_home)
+CONFIG = replace(CONFIG, cuda_home=CUDA_HOME, nvshmem_home=NVSHMEM_HOME)
+# FlagTree's raw CUDA frontend currently discovers nvcc through CUDA_HOME. Keep
+# this compatibility setting local to the dedicated launcher/worker process and
+# establish it before importing Triton/TLE.
+os.environ["CUDA_HOME"] = str(CUDA_HOME)
 
 _env = _import_env()
 torch, triton, tl, tle = _env["torch"], _env["triton"], _env["tl"], _env["tle"]
 import triton.experimental.tle.language.raw as tle_raw  # noqa: E402
-from triton.experimental.tle.raw import dialect  # noqa: E402
 
 # Keep FlagTree runnable on this host's validated clang-17 toolchain without
 # modifying the shared virtualenv.  The raw helpers used by v31 already compile
 # and pass 8-rank correctness with this compiler.
-from triton.experimental.tle.raw.cuda import (  # noqa: E402
-    runtime as _tle_raw_cuda_runtime,
-)
+from triton.experimental.tle.raw import dialect  # noqa: E402
+from triton.experimental.tle.raw.cuda import runtime as _cuda_runtime  # noqa: E402
 from triton.language.extra import libdevice  # noqa: E402
 from triton.tools.tensor_descriptor import TensorDescriptor  # noqa: E402
 
-_tle_raw_cuda_runtime._MIN_CLANG_MAJOR = 17
-_tle_raw_cuda_runtime._resolve_clang.cache_clear()
+_cuda_runtime._MIN_CLANG_MAJOR = 17
+_cuda_runtime._resolve_clang.cache_clear()
 
 RAW_DIR = Path(__file__).resolve().parent
 
@@ -2922,12 +3073,13 @@ def rr_select(counts_per_rank, slot):
         remaining = [v - min(v, length) for v in remaining]
 
 
-def run_worker() -> int:
-    os.environ["NVSHMEM_HOME"] = str(NVSHMEM_HOME)
-    os.environ["LD_LIBRARY_PATH"] = f"{NVSHMEM_HOME / 'lib'}:" + os.environ.get(
-        "LD_LIBRARY_PATH", ""
+def run_worker(config: MegaMoEConfig) -> int:
+    host_so = _compile_nvshmem_host_so(
+        SUPPORT_DIR / "nvshmem_host.cu",
+        cuda_home=config.cuda_home,
+        nvshmem_home=config.nvshmem_home,
+        build_dir=CACHE_ROOT / "host",
     )
-    host_so = _compile_nvshmem_host_so(SUPPORT_DIR / "nvshmem_host.cu")
     lib = ctypes.CDLL(str(host_so))
     lib.nvshmem_init_wrapper.restype = None
     lib.nvshmem_team_mype_wrapper.restype = ctypes.c_int
@@ -2951,36 +3103,35 @@ def run_worker() -> int:
 
     # ---- shape config (identical on every rank) ----
     NUM_SMS = (
-        int(os.environ.get("W_NUM_SMS", "0"))
+        config.num_sms
         or torch.cuda.get_device_properties(
             torch.cuda.current_device()
         ).multi_processor_count
     )
-    NTOK = int(os.environ.get("W_NTOK", "128"))
-    TOPK = int(os.environ.get("W_TOPK", "4"))
-    NEXP = int(os.environ.get("W_NEXP", "16"))
-    K = int(os.environ.get("W_K", "256"))
-    INTER_ENV = int(os.environ.get("W_INTER", "128"))
+    NTOK = config.tokens
+    TOPK = config.topk
+    NEXP = config.num_experts
+    K = config.hidden_size
+    INTER_ENV = config.intermediate_size
     NL1N = INTER_ENV // 64
-    BENCH = int(os.environ.get("W_BENCH", "0"))
-    # Immutable adopted choices; environment variables cannot change version semantics.
+    BENCH = int(config.benchmark)
+    # Immutable adopted choices; command-line options cannot change version semantics.
     USE_L2_TMA = 0
     USE_L1_STORE_PIPE = 0
     USE_D8_TMA1D = 2
     USE_SMEM_EXPERT_COUNT = 1
     FAST_NVLINK_BARRIER = 1
     D8_PULL_STREAMS = 2
-    BENCH_ITERS = int(os.environ.get("W_ITERS", "20"))
-    BENCH_WARMUP = int(os.environ.get("W_WARMUP", "5"))
-    BENCH_REDUCE = os.environ.get("W_BENCH_REDUCE", "median").lower()
-    GPU_START_BARRIER = int(os.environ.get("W_GPU_START_BARRIER", "0"))
-    assert BENCH_REDUCE in ("median", "mean"), BENCH_REDUCE
+    BENCH_ITERS = config.iterations
+    BENCH_WARMUP = config.warmup
+    BENCH_REDUCE = config.reduce
+    GPU_START_BARRIER = int(config.gpu_start_barrier)
     BLOCK_M, BLOCK_N, BLOCK_K = (
         128,
         128,
         128,
     )  # v31: BM128 tile, split across 2 math WGs
-    STAGES = int(os.environ.get("W_STAGES", "2"))
+    STAGES = config.stages
     if USE_D8_TMA1D:
         assert (
             0 < K <= 4096 and K % 16 == 0
@@ -2989,6 +3140,10 @@ def run_worker() -> int:
     assert (
         D8_PULL_STREAMS == 1 or USE_D8_TMA1D > 1
     ), "two D8 pull streams require the full raw TMA1D load+store path"
+    if R != config.num_ranks:
+        raise ValueError(
+            f"NVSHMEM initialized {R} ranks, but --num-ranks={config.num_ranks}"
+        )
     assert NEXP % R == 0, f"NEXP={NEXP} must be divisible by npes={R}"
     EPR = NEXP // R
     # v172: UserHopper's MoE-7 heuristic schedules eight experts per wave.
@@ -3002,9 +3157,7 @@ def run_worker() -> int:
     NK2 = INTER // BLOCK_K
     NPAIR = BLOCK_N // 16
     NSF = K // 128
-    MAX_RECV = int(os.environ.get("W_MAX_RECV", "512"))
-    if MAX_RECV <= 0:
-        raise ValueError(f"W_MAX_RECV must be positive: {MAX_RECV}")
+    MAX_RECV = config.max_recv
     # Dispatch route tile.  Keep the historical default for old versions, but
     # expose it so newer experiments can match the two-warp CUDA frontend
     # (one route per lane, i.e. 2 * 32 routes per CTA).
@@ -3019,18 +3172,14 @@ def run_worker() -> int:
     NSF_POW2 = 1 << (NSF - 1).bit_length()
 
     # ---- inputs and weights ----
-    # When MEGAMOE_SHARED_DATA_DIR is set, CUDA and TLE consume byte-identical
-    # Qwen3 activations, scales, routing and checkpoint FP8 expert weights.
-    # The random path remains available for legacy regression
-    # runs, but it is not a real-data comparison.
-    DROP = float(os.environ.get("W_DROP", "0.1"))
-    shared_data_dir = os.environ.get("MEGAMOE_SHARED_DATA_DIR", "").strip()
+    # When --data-dir is set, CUDA and TLE consume byte-identical Qwen3
+    # activations, scales, routing and checkpoint FP8 expert weights.  The
+    # random path remains available for regression runs.
+    DROP = config.drop_rate
     data_label = "random"
-    if shared_data_dir:
-        if DROP != 0:
-            raise ValueError("real Qwen3 shared data requires W_DROP=0")
+    if config.data_dir is not None:
         dataset = load_qwen3_rank_data(
-            shared_data_dir,
+            config.data_dir,
             rank=rank,
             num_ranks=R,
             num_tokens=NTOK,
@@ -3039,6 +3188,7 @@ def run_worker() -> int:
             num_experts=NEXP,
             topk=TOPK,
             torch=torch,
+            verify_sha256=config.verify_data_sha256,
         )
         shared, local = dataset["shared"], dataset["local"]
         topk_all = shared["topk_idx"].reshape(R, routes).contiguous()
@@ -3111,10 +3261,7 @@ def run_worker() -> int:
         for o in range(R)
     ]
     peak_recv = max(
-        counts[o][le][src]
-        for o in range(R)
-        for le in range(EPR)
-        for src in range(R)
+        counts[o][le][src] for o in range(R) for le in range(EPR) for src in range(R)
     )
     if peak_recv > MAX_RECV:
         raise ValueError(
@@ -3538,7 +3685,7 @@ def run_worker() -> int:
     ]
     torch.cuda.synchronize()
 
-    inject = os.environ.get("W_INJECT", "")
+    inject = config.inject_fault
     if inject == "queue":
         q_c[0] = (int(q_c[0]) + 1) % (NTOK * TOPK)  # valid-but-wrong route
     elif inject == "recv":
@@ -3692,36 +3839,29 @@ def run_worker() -> int:
     return 0 if ok else 1
 
 
-def main() -> int:
-    if "--worker" in sys.argv:
-        return run_worker()
+def main(config: MegaMoEConfig = CONFIG) -> int:
+    if config.worker:
+        return run_worker(config)
     env = os.environ.copy()
     # This parent imported Triton before MPI assigned a rank, so its cache path
     # necessarily ends in rank-0.  Do not leak that path to every worker:
     # each worker must recompute TRITON_CACHE_DIR from OMPI_COMM_WORLD_RANK at
     # import time or cold multi-rank compiles contend on one cache lock.
     env.pop("TRITON_CACHE_DIR", None)
-    cuda_home = env.get("CUDA_HOME", "/usr/local/cuda-12.8")
     env.update(
         {
-            "NVSHMEM_HOME": str(NVSHMEM_HOME),
             "NVSHMEM_BOOTSTRAP": "MPI",
-            "LD_LIBRARY_PATH": f"{NVSHMEM_HOME / 'lib'}:{env.get('LD_LIBRARY_PATH', '')}",
-            "CUDA_HOME": cuda_home,
-            "CPATH": f"{cuda_home}/targets/x86_64-linux/include:"
-            + env.get("CPATH", ""),
+            "CUDA_HOME": str(config.cuda_home),
         }
     )
-    worker_python = str(TLE_PYTHON if TLE_PYTHON.exists() else Path(sys.executable))
-    mpi_launcher = os.environ.get("MEGAMOE_MPIRUN", "/usr/bin/mpirun")
     cmd = [
-        mpi_launcher,
+        config.mpirun,
         "--allow-run-as-root",
         "-np",
-        str(NUM_RANKS),
-        worker_python,
+        str(config.num_ranks),
+        sys.executable,
         str(Path(__file__).resolve()),
-        "--worker",
+        *_worker_cli_args(config),
     ]
     try:
         proc = subprocess.run(
@@ -3729,7 +3869,7 @@ def main() -> int:
             check=False,
             capture_output=True,
             text=True,
-            timeout=int(os.environ.get("W_TIMEOUT", "600")),
+            timeout=config.timeout,
             env=env,
         )
     except subprocess.TimeoutExpired as exc:

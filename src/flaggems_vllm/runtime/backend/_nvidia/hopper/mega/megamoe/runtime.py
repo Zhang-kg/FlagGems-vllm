@@ -17,55 +17,98 @@
 from __future__ import annotations
 
 import fcntl
+import hashlib
+import importlib
+import importlib.util
 import os
-import site
+import shutil
 import subprocess
-import sys
-import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional, Union
 
-_mega_site_override = os.environ.get("MEGAMOE_TORCH_SITE_PACKAGES")
-MEGA_SITE = Path(_mega_site_override).resolve() if _mega_site_override else None
-if MEGA_SITE is not None:
-    site.addsitedir(str(MEGA_SITE))
+PathLike = Union[str, Path]
 
 
-def _find_nvshmem_home() -> Path:
+def _cuda_root(candidate: PathLike, source: str) -> Path:
+    root = Path(candidate).expanduser().resolve()
+    if not (root / "bin" / "nvcc").is_file():
+        raise RuntimeError(f"{source} does not contain bin/nvcc: {root}")
+    return root
+
+
+def _find_cuda_home(explicit: Optional[PathLike] = None) -> Path:
+    """Resolve a CUDA toolkit without modifying the process environment."""
+
+    if explicit is not None:
+        return _cuda_root(explicit, "CUDA toolkit path")
+
+    for variable in ("CUDA_HOME", "CUDA_PATH"):
+        override = os.environ.get(variable)
+        if override:
+            return _cuda_root(override, variable)
+
+    nvcc = shutil.which("nvcc")
+    if nvcc is not None:
+        return _cuda_root(Path(nvcc).resolve().parent.parent, "nvcc on PATH")
+
+    try:
+        torch_cpp_extension = importlib.import_module("torch.utils.cpp_extension")
+        torch_cuda_home = getattr(torch_cpp_extension, "CUDA_HOME", None)
+    except (ImportError, OSError):
+        torch_cuda_home = None
+    if torch_cuda_home:
+        return _cuda_root(torch_cuda_home, "torch CUDA_HOME")
+
+    common_roots = [Path("/usr/local/cuda"), Path("/opt/cuda")]
+    for parent in (Path("/usr/local"), Path("/opt")):
+        if parent.is_dir():
+            common_roots.extend(sorted(parent.glob("cuda-*"), reverse=True))
+    for root in common_roots:
+        if (root / "bin" / "nvcc").is_file():
+            return root.resolve()
+
+    raise RuntimeError(
+        "CUDA toolkit not found; pass cuda_home, set CUDA_HOME/CUDA_PATH, "
+        "or put nvcc on PATH"
+    )
+
+
+def _nvshmem_root(candidate: PathLike, source: str) -> Path:
+    root = Path(candidate).expanduser().resolve()
+    missing = [name for name in ("include", "lib") if not (root / name).is_dir()]
+    if missing:
+        missing_text = ", ".join(missing)
+        raise RuntimeError(f"{source} is missing {missing_text}: {root}")
+    return root
+
+
+def _find_nvshmem_home(explicit: Optional[PathLike] = None) -> Path:
+    """Resolve the NVSHMEM include/lib root without changing ``os.environ``."""
+
+    if explicit is not None:
+        return _nvshmem_root(explicit, "NVSHMEM installation")
+
     override = os.environ.get("NVSHMEM_HOME")
     if override:
-        return Path(override).expanduser().resolve()
+        return _nvshmem_root(override, "NVSHMEM_HOME")
 
-    site_roots = []
-    if MEGA_SITE is not None:
-        site_roots.append(MEGA_SITE)
-    site_roots.extend(Path(path) for path in site.getsitepackages())
-    site_roots.append(Path(site.getusersitepackages()))
-    site_roots.append(
-        Path(sys.prefix)
-        / "lib"
-        / f"python{sys.version_info.major}.{sys.version_info.minor}"
-        / "site-packages"
-    )
-    for root in site_roots:
-        candidate = root / "nvidia" / "nvshmem"
-        if candidate.is_dir():
-            return candidate.resolve()
+    try:
+        nvshmem_package = importlib.import_module("nvidia.nvshmem")
+    except ImportError as error:
+        message = (
+            "NVSHMEM installation not found; pass nvshmem_home or set NVSHMEM_HOME"
+        )
+        raise RuntimeError(message) from error
+
+    package_roots = getattr(nvshmem_package, "__path__", ())
+    for package_root in package_roots:
+        try:
+            return _nvshmem_root(package_root, "nvidia.nvshmem package")
+        except RuntimeError:
+            continue
     raise RuntimeError(
-        "NVSHMEM installation not found; set NVSHMEM_HOME to its include/lib root"
+        "nvidia.nvshmem does not contain the required include/lib directories"
     )
-
-
-NVSHMEM_HOME = _find_nvshmem_home()
-
-cuda_home = os.environ.get("CUDA_HOME", "/usr/local/cuda-12.8")
-os.environ.setdefault("CUDA_HOME", cuda_home)
-os.environ["CPATH"] = f"{cuda_home}/targets/x86_64-linux/include:" + os.environ.get(
-    "CPATH", ""
-)
-os.environ["LD_LIBRARY_PATH"] = (
-    f"{NVSHMEM_HOME / 'lib'}:{cuda_home}/lib64:" + os.environ.get("LD_LIBRARY_PATH", "")
-)
 
 
 def _import_env() -> dict[str, Any]:
@@ -77,48 +120,92 @@ def _import_env() -> dict[str, Any]:
     return {"torch": torch, "triton": triton, "tl": tl, "tle": tle}
 
 
-def _compile_nvshmem_host_so(host_src: Path) -> Path:
+def _default_build_dir() -> Path:
+    # Keep this import lazy. The fallback loads the same helper by file path so
+    # direct execution of ``kernel.py`` need not import the package root.
+    if __package__:
+        from flaggems_vllm.utils.code_cache import code_cache_dir
+    else:
+        module_path = Path(__file__).resolve().parents[6] / "utils" / "code_cache.py"
+        spec = importlib.util.spec_from_file_location(
+            "_flaggems_vllm_code_cache", module_path
+        )
+        if spec is None or spec.loader is None:
+            raise ImportError(f"Cannot load FlagGems-vLLM code cache: {module_path}")
+        code_cache = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(code_cache)
+        code_cache_dir = code_cache.code_cache_dir
+
+    return code_cache_dir() / "megamoe"
+
+
+def _compile_nvshmem_host_so(
+    host_src: Path,
+    *,
+    cuda_home: Optional[PathLike] = None,
+    nvshmem_home: Optional[PathLike] = None,
+    build_dir: Optional[PathLike] = None,
+) -> Path:
     """Build the tiny host-side NVSHMEM wrapper once across all MPI ranks."""
 
-    default_cache = (
-        Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
-        / "flaggems_vllm"
-        / "megamoe"
+    host_src = Path(host_src).expanduser().resolve()
+    if not host_src.is_file():
+        raise FileNotFoundError(f"NVSHMEM host source does not exist: {host_src}")
+
+    cuda_root = _find_cuda_home(cuda_home)
+    nvshmem_root = _find_nvshmem_home(nvshmem_home)
+    output_dir = (
+        Path(build_dir).expanduser().resolve()
+        if build_dir is not None
+        else _default_build_dir()
     )
-    build_dir = Path(os.environ.get("MEGAMOE_BUILD_DIR", default_cache))
-    build_dir.mkdir(parents=True, exist_ok=True)
-    so_path = build_dir / "nvshmem_host_sm90a.so"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    cache_key = hashlib.sha256()
+    cache_key.update(host_src.read_bytes())
+    cache_key.update(b"sm_90a|-shared|-fPIC|-rdc=true|-lnvshmem_host|-lnvshmem_device")
+    nvshmem_lib = nvshmem_root / "lib"
+    dependencies = {cuda_root / "bin" / "nvcc"}
+    for pattern in ("libnvshmem_host.so*", "libnvshmem_device.*"):
+        dependencies.update(path.resolve() for path in nvshmem_lib.glob(pattern))
+    for dependency in sorted(dependencies, key=str):
+        cache_key.update(str(dependency).encode())
+        if dependency.exists():
+            stat = dependency.stat()
+            cache_key.update(f"{stat.st_size}:{stat.st_mtime_ns}".encode())
+    digest = cache_key.hexdigest()[:16]
+    so_path = output_dir / f"nvshmem_host_sm90a_{digest}.so"
     lock_path = so_path.with_suffix(".so.lock")
     with lock_path.open("w") as lock_file:
-        while True:
-            try:
-                fcntl.flock(lock_file, fcntl.LOCK_EX)
-                break
-            except BlockingIOError:
-                time.sleep(0.1)
-        if (
-            so_path.exists()
-            and so_path.stat().st_mtime_ns >= host_src.stat().st_mtime_ns
-        ):
+        fcntl.flock(lock_file, fcntl.LOCK_EX)
+        if so_path.exists():
             return so_path
+
+        temporary_path = so_path.with_name(f"{so_path.name}.{os.getpid()}.tmp")
         cmd = [
-            str(Path(cuda_home) / "bin" / "nvcc"),
+            str(cuda_root / "bin" / "nvcc"),
             "-shared",
             "-Xcompiler",
             "-fPIC",
             "-rdc=true",
             "-arch=sm_90a",
-            f"-I{NVSHMEM_HOME / 'include'}",
-            f"-L{NVSHMEM_HOME / 'lib'}",
+            f"-I{nvshmem_root / 'include'}",
+            f"-L{nvshmem_lib}",
             "-lnvshmem_host",
             "-lnvshmem_device",
             "-Xlinker",
+            "--enable-new-dtags",
+            "-Xlinker",
             "-rpath",
             "-Xlinker",
-            str(NVSHMEM_HOME / "lib"),
+            str(nvshmem_lib),
             "-o",
-            str(so_path),
+            str(temporary_path),
             str(host_src),
         ]
-        subprocess.run(cmd, check=True, capture_output=True)
+        try:
+            subprocess.run(cmd, check=True, capture_output=True)
+            temporary_path.replace(so_path)
+        finally:
+            temporary_path.unlink(missing_ok=True)
     return so_path
