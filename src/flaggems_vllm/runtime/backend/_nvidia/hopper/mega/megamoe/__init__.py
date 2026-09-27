@@ -14,8 +14,20 @@
 
 """Triton/TLE Hopper MegaMoE production-shape candidate."""
 
-from pathlib import Path
+from .launcher import (
+    MEGAMOE_KERNEL_PATH,
+    MegaMoEConfig,
+    MegaMoELaunchError,
+    MegaMoEResult,
+    launch_megamoe,
+    resolve_mpirun,
+)
 
-MEGAMOE_KERNEL_PATH = Path(__file__).with_name("kernel.py")
-
-__all__ = ["MEGAMOE_KERNEL_PATH"]
+__all__ = [
+    "MEGAMOE_KERNEL_PATH",
+    "MegaMoEConfig",
+    "MegaMoELaunchError",
+    "MegaMoEResult",
+    "launch_megamoe",
+    "resolve_mpirun",
+]

@@ -81,164 +81,34 @@ MPI worker.
 
 from __future__ import annotations
 
-import argparse
 import ctypes
 import os
-import shutil
-import subprocess
 import sys
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from pathlib import Path
 
 SUPPORT_DIR = Path(__file__).resolve().parent
 
-
-@dataclass(frozen=True)
-class MegaMoEConfig:
-    """Configuration shared by the launcher and every MPI worker."""
-
-    worker: bool = False
-    num_ranks: int = 2
-    tokens: int = 128
-    hidden_size: int = 256
-    intermediate_size: int = 128
-    num_experts: int = 16
-    topk: int = 4
-    stages: int = 2
-    num_sms: int = 0
-    max_recv: int = 512
-    drop_rate: float = 0.1
-    benchmark: bool = False
-    warmup: int = 5
-    iterations: int = 20
-    reduce: str = "median"
-    gpu_start_barrier: bool = False
-    data_dir: Path | None = None
-    verify_data_sha256: bool = False
-    inject_fault: str | None = None
-    mpirun: str = "/usr/bin/mpirun"
-    timeout: int = 600
-    cuda_home: Path | None = None
-    nvshmem_home: Path | None = None
-
-
-def _config_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description="Run the Hopper MegaMoE standalone launcher."
+if __package__:
+    from .launcher import (  # noqa: E402
+        MegaMoEConfig,
+        launch_megamoe_cli,
+        parse_megamoe_config,
     )
-    parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
-    parser.add_argument("--num-ranks", type=int, default=2)
-    parser.add_argument("--tokens", type=int, default=128)
-    parser.add_argument("--hidden-size", type=int, default=256)
-    parser.add_argument("--intermediate-size", type=int, default=128)
-    parser.add_argument("--num-experts", type=int, default=16)
-    parser.add_argument("--topk", type=int, default=4)
-    parser.add_argument("--stages", type=int, default=2)
-    parser.add_argument("--num-sms", type=int, default=0)
-    parser.add_argument("--max-recv", type=int, default=512)
-    parser.add_argument("--drop-rate", type=float)
-    parser.add_argument("--benchmark", action="store_true")
-    parser.add_argument("--warmup", type=int, default=5)
-    parser.add_argument("--iterations", type=int, default=20)
-    parser.add_argument("--reduce", choices=("mean", "median"), default="median")
-    parser.add_argument("--gpu-start-barrier", action="store_true")
-    parser.add_argument("--data-dir", type=Path)
-    parser.add_argument("--verify-data-sha256", action="store_true")
-    parser.add_argument(
-        "--inject-fault",
-        choices=("queue", "recv", "meta", "scatter", "combine"),
+else:
+    sys.path.insert(0, str(SUPPORT_DIR))
+    from launcher import (  # noqa: E402
+        MegaMoEConfig,
+        launch_megamoe_cli,
+        parse_megamoe_config,
     )
-    parser.add_argument("--mpirun", default=shutil.which("mpirun") or "/usr/bin/mpirun")
-    parser.add_argument("--timeout", type=int, default=600)
-    parser.add_argument("--cuda-home", type=Path)
-    parser.add_argument("--nvshmem-home", type=Path)
-    return parser
 
+CONFIG = parse_megamoe_config() if __name__ == "__main__" else MegaMoEConfig()
 
-def _parse_config(argv: list[str] | None = None) -> MegaMoEConfig:
-    args = _config_parser().parse_args(argv)
-    if args.drop_rate is None:
-        args.drop_rate = 0.0 if args.data_dir is not None else 0.1
-    config = MegaMoEConfig(**vars(args))
-    if config.num_ranks <= 0:
-        raise ValueError("--num-ranks must be positive")
-    if config.tokens <= 0:
-        raise ValueError("--tokens must be positive")
-    if config.hidden_size <= 0 or config.hidden_size % 128:
-        raise ValueError("--hidden-size must be a positive multiple of 128")
-    if config.intermediate_size <= 0 or config.intermediate_size % 64:
-        raise ValueError("--intermediate-size must be a positive multiple of 64")
-    if config.num_experts <= 0 or config.num_experts % config.num_ranks:
-        raise ValueError("--num-experts must be positive and divisible by --num-ranks")
-    if not 0 < config.topk <= config.num_experts:
-        raise ValueError("--topk must be in [1, num_experts]")
-    if config.stages <= 0:
-        raise ValueError("--stages must be positive")
-    if config.num_sms < 0:
-        raise ValueError("--num-sms cannot be negative")
-    if config.max_recv <= 0:
-        raise ValueError("--max-recv must be positive")
-    if not 0.0 <= config.drop_rate < 1.0:
-        raise ValueError("--drop-rate must be in [0, 1)")
-    if config.warmup < 0 or config.iterations <= 0:
-        raise ValueError(
-            "--warmup cannot be negative and --iterations must be positive"
-        )
-    if config.timeout <= 0:
-        raise ValueError("--timeout must be positive")
-    if config.data_dir is not None and config.drop_rate != 0.0:
-        raise ValueError("--data-dir requires --drop-rate=0")
-    return config
-
-
-def _worker_cli_args(config: MegaMoEConfig) -> list[str]:
-    args = [
-        "--worker",
-        "--num-ranks",
-        str(config.num_ranks),
-        "--tokens",
-        str(config.tokens),
-        "--hidden-size",
-        str(config.hidden_size),
-        "--intermediate-size",
-        str(config.intermediate_size),
-        "--num-experts",
-        str(config.num_experts),
-        "--topk",
-        str(config.topk),
-        "--stages",
-        str(config.stages),
-        "--num-sms",
-        str(config.num_sms),
-        "--max-recv",
-        str(config.max_recv),
-        "--drop-rate",
-        str(config.drop_rate),
-        "--warmup",
-        str(config.warmup),
-        "--iterations",
-        str(config.iterations),
-        "--reduce",
-        config.reduce,
-    ]
-    if config.benchmark:
-        args.append("--benchmark")
-    if config.gpu_start_barrier:
-        args.append("--gpu-start-barrier")
-    if config.data_dir is not None:
-        args.extend(("--data-dir", str(config.data_dir)))
-    if config.verify_data_sha256:
-        args.append("--verify-data-sha256")
-    if config.inject_fault is not None:
-        args.extend(("--inject-fault", config.inject_fault))
-    if config.cuda_home is not None:
-        args.extend(("--cuda-home", str(config.cuda_home)))
-    if config.nvshmem_home is not None:
-        args.extend(("--nvshmem-home", str(config.nvshmem_home)))
-    return args
-
-
-CONFIG = _parse_config() if __name__ == "__main__" else MegaMoEConfig()
+# A normal CLI invocation is only a launcher.  Exit before importing Triton so
+# the parent process stays lightweight; MPI workers continue below.
+if __name__ == "__main__" and not CONFIG.worker:
+    sys.exit(launch_megamoe_cli(CONFIG))
 
 if __package__:
     from .qwen3_fp8_shared_data import (  # noqa: E402
@@ -254,7 +124,6 @@ if __package__:
         _import_env,
     )
 else:
-    sys.path.insert(0, str(SUPPORT_DIR))
     from qwen3_fp8_shared_data import (  # noqa: E402
         fp8_from_uint8,
         interleave_l1_gate_up_rows,
@@ -3842,47 +3711,7 @@ def run_worker(config: MegaMoEConfig) -> int:
 def main(config: MegaMoEConfig = CONFIG) -> int:
     if config.worker:
         return run_worker(config)
-    env = os.environ.copy()
-    # This parent imported Triton before MPI assigned a rank, so its cache path
-    # necessarily ends in rank-0.  Do not leak that path to every worker:
-    # each worker must recompute TRITON_CACHE_DIR from OMPI_COMM_WORLD_RANK at
-    # import time or cold multi-rank compiles contend on one cache lock.
-    env.pop("TRITON_CACHE_DIR", None)
-    env.update(
-        {
-            "NVSHMEM_BOOTSTRAP": "MPI",
-            "CUDA_HOME": str(config.cuda_home),
-        }
-    )
-    cmd = [
-        config.mpirun,
-        "--allow-run-as-root",
-        "-np",
-        str(config.num_ranks),
-        sys.executable,
-        str(Path(__file__).resolve()),
-        *_worker_cli_args(config),
-    ]
-    try:
-        proc = subprocess.run(
-            cmd,
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=config.timeout,
-            env=env,
-        )
-    except subprocess.TimeoutExpired as exc:
-        print("TIMEOUT\nstdout:", (exc.stdout or "")[-2500:])
-        print("stderr:", (exc.stderr or "")[-2500:])
-        return 1
-    # Forward the workers' output whole: every rank's result line has to
-    # reach whatever is reading this launcher, and a tail cuts off the
-    # low-numbered ranks as soon as anything else writes to stdout.
-    print(proc.stdout, end="")
-    if proc.returncode != 0:
-        print("STDERR:", proc.stderr[-4000:])
-    return proc.returncode
+    return launch_megamoe_cli(config)
 
 
 if __name__ == "__main__":
