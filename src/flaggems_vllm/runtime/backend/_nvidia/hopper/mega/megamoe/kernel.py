@@ -21,90 +21,20 @@ final reduction in one launch.
 
 from __future__ import annotations
 
-import ctypes
-import os
-import sys
-from dataclasses import replace
 from pathlib import Path
+from typing import TYPE_CHECKING
 
-SUPPORT_DIR = Path(__file__).resolve().parent
+import torch
+import triton
+import triton.experimental.tle.language as tle
+import triton.experimental.tle.language.raw as tle_raw
+import triton.language as tl
+from triton.experimental.tle.raw import dialect
+from triton.language.extra import libdevice
+from triton.tools.tensor_descriptor import TensorDescriptor
 
-if __package__:
-    from ._launcher import (  # noqa: E402
-        MegaMoEConfig,
-        launch_megamoe_cli,
-        parse_megamoe_config,
-    )
-else:
-    from _launcher import (  # noqa: E402
-        MegaMoEConfig,
-        launch_megamoe_cli,
-        parse_megamoe_config,
-    )
-
-CONFIG = parse_megamoe_config() if __name__ == "__main__" else MegaMoEConfig()
-
-# A normal CLI invocation is only a launcher.  Exit before importing Triton so
-# the parent process stays lightweight; MPI workers continue below.
-if __name__ == "__main__" and not CONFIG.worker:
-    sys.exit(launch_megamoe_cli(CONFIG))
-
-if __package__:
-    from .qwen3_fp8_shared_data import (  # noqa: E402
-        fp8_from_uint8,
-        interleave_l1_gate_up_rows,
-        load_qwen3_rank_data,
-    )
-    from .runtime import (  # noqa: E402
-        _compile_nvshmem_host_so,
-        _default_build_dir,
-        _find_cuda_home,
-        _find_nvshmem_home,
-        _import_env,
-    )
-else:
-    from qwen3_fp8_shared_data import (  # noqa: E402
-        fp8_from_uint8,
-        interleave_l1_gate_up_rows,
-        load_qwen3_rank_data,
-    )
-    from runtime import (  # noqa: E402
-        _compile_nvshmem_host_so,
-        _default_build_dir,
-        _find_cuda_home,
-        _find_nvshmem_home,
-        _import_env,
-    )
-
-# MUST precede the triton import: ranks sharing one cache dir deadlock on its lock.
-CACHE_ROOT = _default_build_dir()
-rank_env = os.environ.get("OMPI_COMM_WORLD_RANK", os.environ.get("PMI_RANK", "0"))
-os.environ.setdefault(
-    "TRITON_CACHE_DIR", str(CACHE_ROOT / f"tle-megamoe-v234-rank-{rank_env}")
-)
-
-CUDA_HOME = _find_cuda_home(CONFIG.cuda_home)
-NVSHMEM_HOME = _find_nvshmem_home(CONFIG.nvshmem_home)
-CONFIG = replace(CONFIG, cuda_home=CUDA_HOME, nvshmem_home=NVSHMEM_HOME)
-# FlagTree's raw CUDA frontend currently discovers nvcc through CUDA_HOME. Keep
-# this compatibility setting local to the dedicated launcher/worker process and
-# establish it before importing Triton/TLE.
-os.environ["CUDA_HOME"] = str(CUDA_HOME)
-
-_env = _import_env()
-torch, triton, tl, tle = _env["torch"], _env["triton"], _env["tl"], _env["tle"]
-import triton.experimental.tle.language.raw as tle_raw  # noqa: E402
-
-# Keep FlagTree runnable on this host's validated clang-17 toolchain without
-# modifying the shared virtualenv.  The raw helpers used by v31 already compile
-# and pass 8-rank correctness with this compiler.
-from triton.experimental.tle.raw import dialect  # noqa: E402
-from triton.experimental.tle.raw.cuda import runtime as _cuda_runtime  # noqa: E402
-from triton.language.extra import libdevice  # noqa: E402
-from triton.tools.tensor_descriptor import TensorDescriptor  # noqa: E402
-
-_cuda_runtime._MIN_CLANG_MAJOR = 17
-_cuda_runtime._resolve_clang.cache_clear()
+if TYPE_CHECKING:
+    from .api import MegaMoEContext
 
 RAW_DIR = Path(__file__).resolve().parent
 
@@ -118,14 +48,6 @@ LOADER_WARPS = 4
     extern_func_name="TleL2WideScatter",
 )
 def l2_wide_scatter_edsl(*args, **kwargs): ...
-
-
-@dialect(
-    name="cuda",
-    file=RAW_DIR / "raw_l2_tma_scatter.cu",
-    extern_func_name="TleL2TmaScatter",
-)
-def l2_tma_scatter_edsl(*args, **kwargs): ...
 
 
 @dialect(
@@ -318,7 +240,16 @@ def sym_zero(tab, PE, NB, BLOCK: tl.constexpr):
 def sym_h2d(src, tab, PE, NB, BLOCK: tl.constexpr):
     offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     m = offs < NB
-    tl.store(peer_i8(tab, PE) + offs, tl.load(src + offs, mask=m), mask=m)
+    src_bytes = src.to(tl.pointer_type(tl.int8))
+    tl.store(peer_i8(tab, PE) + offs, tl.load(src_bytes + offs, mask=m), mask=m)
+
+
+@triton.jit
+def fill_bytes(dst, NB, VALUE: tl.constexpr, BLOCK: tl.constexpr):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < NB
+    dst_bytes = dst.to(tl.pointer_type(tl.int8))
+    tl.store(dst_bytes + offs, tl.full((BLOCK,), VALUE, tl.int8), mask=mask)
 
 
 # ---------------------------------------------------------------------------
@@ -526,7 +457,6 @@ def math_role(
     gctr,
     w1_sf,
     w2_sf,
-    USE_L2_TMA: tl.constexpr,
     WG: tl.constexpr,
     USE_L1_STORE_PIPE: tl.constexpr,
     MY_PE: tl.constexpr,
@@ -920,16 +850,10 @@ def math_role(
                         (), 9 + WG, tl.int32
                     )  # per-WG named barrier (9 / 10)
                     scatter_cols = tl.full((), BLOCK_N, tl.int32)
-                    if USE_L2_TMA:
-                        tle_raw.call(
-                            l2_tma_scatter_edsl,
-                            [cd_addr, dst_addr, valid_m_wg, scatter_cols, bar_wg],
-                        )
-                    else:
-                        tle_raw.call(
-                            l2_wide_scatter_edsl,
-                            [cd_addr, dst_addr, valid_m_wg, scatter_cols, bar_wg],
-                        )
+                    tle_raw.call(
+                        l2_wide_scatter_edsl,
+                        [cd_addr, dst_addr, valid_m_wg, scatter_cols, bar_wg],
+                    )
 
     # v31: only WG0 runs the cross-rank barrier + combine (per-token, tiny).
     if WG == 0:
@@ -1342,7 +1266,6 @@ def ws_megakernel(
     tp6,
     tp7,
     l1_st_desc,
-    USE_L2_TMA: tl.constexpr,
     USE_D8_TMA1D: tl.constexpr,
     USE_L1_STORE_PIPE: tl.constexpr,
     USE_SMEM_EXPERT_COUNT: tl.constexpr,
@@ -1384,7 +1307,6 @@ def ws_megakernel(
     MATH_WARPS: tl.constexpr,
 ):
     # Reject direct launches that try to mutate this immutable snapshot.
-    tl.static_assert(USE_L2_TMA == 0, "snapshot fixes USE_L2_TMA=False")
     tl.static_assert(USE_L1_STORE_PIPE == 0, "snapshot fixes USE_L1_STORE_PIPE=False")
     tl.static_assert(USE_D8_TMA1D == 2, "snapshot fixes full raw D8 TMA1D")
     tl.static_assert(USE_SMEM_EXPERT_COUNT, "snapshot fixes SMEM expert counts")
@@ -1488,7 +1410,6 @@ def ws_megakernel(
                     gctr,
                     w1_sf,
                     w2_sf,
-                    USE_L2_TMA,
                     0,
                     USE_L1_STORE_PIPE,
                     MY_PE,
@@ -1541,7 +1462,6 @@ def ws_megakernel(
                     gctr,
                     w1_sf,
                     w2_sf,
-                    USE_L2_TMA,
                     1,
                     USE_L1_STORE_PIPE,
                     MY_PE,
@@ -1690,480 +1610,287 @@ def ws_megakernel(
     )
 
 
-def run_worker(config: MegaMoEConfig) -> int:
-    host_so = _compile_nvshmem_host_so(
-        SUPPORT_DIR / "nvshmem_host.cu",
-        cuda_home=config.cuda_home,
-        nvshmem_home=config.nvshmem_home,
-        build_dir=CACHE_ROOT / "host",
+def _fill_tensor_bytes(tensor, value: int) -> None:
+    block = 1024
+    nbytes = tensor.numel() * tensor.element_size()
+    fill_bytes[(triton.cdiv(nbytes, block),)](
+        tensor,
+        nbytes,
+        VALUE=value,
+        BLOCK=block,
     )
-    lib = ctypes.CDLL(str(host_so))
-    lib.nvshmem_init_wrapper.restype = None
-    lib.nvshmem_team_mype_wrapper.restype = ctypes.c_int
-    lib.nvshmem_mype_wrapper.restype = ctypes.c_int
-    lib.nvshmem_npes_wrapper.restype = ctypes.c_int
-    lib.nvshmem_alloc_bytes_wrapper.argtypes = [ctypes.c_size_t]
-    lib.nvshmem_alloc_bytes_wrapper.restype = ctypes.c_void_p
-    lib.nvshmem_ptr_wrapper.argtypes = [ctypes.c_void_p, ctypes.c_int]
-    lib.nvshmem_ptr_wrapper.restype = ctypes.c_void_p
-    lib.nvshmemx_barrier_wrapper.argtypes = [ctypes.c_void_p]
-    lib.nvshmemx_barrier_wrapper.restype = None
-    lib.nvshmem_finalize_wrapper.restype = None
 
-    lib.nvshmem_init_wrapper()
-    node_pe = lib.nvshmem_team_mype_wrapper()
-    rank = lib.nvshmem_mype_wrapper()
-    R = lib.nvshmem_npes_wrapper()
-    torch.cuda.set_device(node_pe % torch.cuda.device_count())
-    dev = "cuda"
-    f8 = torch.float8_e4m3fn
 
-    # ---- shape config (identical on every rank) ----
-    NUM_SMS = (
-        config.num_sms
-        or torch.cuda.get_device_properties(
-            torch.cuda.current_device()
-        ).multi_processor_count
+def _zero_symmetric(table, rank: int, nbytes: int) -> None:
+    block = 1024
+    sym_zero[(triton.cdiv(nbytes, block),)](
+        table,
+        rank,
+        nbytes,
+        BLOCK=block,
     )
-    NTOK = config.tokens
-    TOPK = config.topk
-    NEXP = config.num_experts
-    K = config.hidden_size
-    INTER_ENV = config.intermediate_size
-    assert NUM_SMS > 0
-    assert NTOK > 0
-    assert 0 < TOPK <= NEXP
-    assert K > 0 and K % 128 == 0
-    assert INTER_ENV > 0 and INTER_ENV % 128 == 0
-    NL1N = INTER_ENV // 64
-    BENCH = int(config.benchmark)
-    # Immutable adopted choices; command-line options cannot change version semantics.
-    USE_L2_TMA = 0
-    USE_L1_STORE_PIPE = 0
-    USE_D8_TMA1D = 2
-    USE_SMEM_EXPERT_COUNT = 1
-    FAST_NVLINK_BARRIER = 1
-    D8_PULL_STREAMS = 2
-    BENCH_ITERS = config.iterations
-    BENCH_WARMUP = config.warmup
-    BENCH_REDUCE = config.reduce
-    GPU_START_BARRIER = int(config.gpu_start_barrier)
-    BLOCK_M, BLOCK_N, BLOCK_K = (
-        128,
-        128,
-        128,
-    )  # v31: BM128 tile, split across 2 math WGs
-    STAGES = config.stages
-    assert STAGES > 0
-    if USE_D8_TMA1D:
-        assert K <= 4096, f"raw D8 TMA1D requires K<=4096, got K={K}"
-    assert D8_PULL_STREAMS in (1, 2), D8_PULL_STREAMS
-    assert (
-        D8_PULL_STREAMS == 1 or USE_D8_TMA1D > 1
-    ), "two D8 pull streams require the full raw TMA1D load+store path"
-    assert R == config.num_ranks
-    assert NEXP % R == 0, f"NEXP={NEXP} must be divisible by npes={R}"
-    EPR = NEXP // R
-    # v172: UserHopper's MoE-7 heuristic schedules eight experts per wave.
-    EPW = min(8, EPR)
-    L1_N = NL1N * BLOCK_N
-    L1_OUT_N = BLOCK_N // 2
-    INTER = NL1N * L1_OUT_N
-    L2_N = K
-    NL2N = L2_N // BLOCK_N
-    NK1 = K // BLOCK_K
-    NK2 = INTER // BLOCK_K
-    NPAIR = BLOCK_N // 16
-    NSF = K // 128
-    MAX_RECV = config.max_recv
-    assert MAX_RECV > 0
-    # Dispatch route tile.  Keep the historical default for old versions, but
-    # expose it so newer experiments can match the two-warp CUDA frontend
-    # (one route per lane, i.e. 2 * 32 routes per CTA).
-    BLOCK_R = 256
-    assert BLOCK_R > 0 and (BLOCK_R & (BLOCK_R - 1)) == 0, BLOCK_R
-    routes = NTOK * TOPK
-    ITERS = (routes + NUM_SMS * BLOCK_R - 1) // (NUM_SMS * BLOCK_R)
-    R_POW2 = 1 << (R - 1).bit_length()
-    EPR_POW2 = 1 << (EPR - 1).bit_length()
-    NEXP_POW2 = 1 << (NEXP - 1).bit_length()
-    K_POW2 = 1 << (K - 1).bit_length()
-    NSF_POW2 = 1 << (NSF - 1).bit_length()
 
-    # ---- inputs and weights ----
-    # When --data-dir is set, CUDA and TLE consume byte-identical Qwen3
-    # activations, scales, routing and checkpoint FP8 expert weights.  The
-    # random path remains available for regression runs.
-    DROP = config.drop_rate
-    if config.data_dir is not None:
-        dataset = load_qwen3_rank_data(
-            config.data_dir,
-            rank=rank,
-            num_tokens=NTOK,
-            torch=torch,
+
+def _stage_symmetric(source, table, rank: int) -> None:
+    block = 1024
+    nbytes = source.numel() * source.element_size()
+    sym_h2d[(triton.cdiv(nbytes, block),)](
+        source,
+        table,
+        rank,
+        nbytes,
+        BLOCK=block,
+    )
+
+
+def launch_megamoe_fp8(
+    input_fp8,
+    input_scales,
+    topk_ids,
+    topk_weights,
+    w1,
+    w1_scales,
+    w2,
+    w2_scales,
+    context: MegaMoEContext,
+    output=None,
+    *,
+    stages: int = 4,
+):
+    """Launch the SM90 FP8 expert-parallel MegaMoE kernel asynchronously."""
+
+    block_m = 128
+    block_n = 128
+    block_k = 128
+    block_r = 256
+
+    assert input_fp8.ndim == 2
+    ntok, hidden = input_fp8.shape
+    assert ntok > 0
+    assert hidden == context.hidden_size and 0 < hidden <= 4096
+    assert hidden % block_k == 0
+    assert context.intermediate_size > 0
+    assert context.intermediate_size % block_k == 0
+    assert context.world_size in (2, 4, 8)
+    assert 0 <= context.rank < context.world_size
+    assert context.num_experts % context.world_size == 0
+    assert context.num_sms > 0
+    assert context.pool_tokens >= block_m
+    assert context.pool_tokens % block_m == 0
+    assert context.max_recv > 0
+    assert 0 < stages
+
+    device = input_fp8.device
+    assert device.type == "cuda"
+    num_sf = hidden // 128
+    assert topk_ids.ndim == 2
+    topk = topk_ids.shape[1]
+    assert 0 < topk <= context.num_experts
+    assert ntok <= context.max_tokens
+    assert topk <= context.max_topk
+    assert tuple(input_scales.shape) == (ntok, num_sf)
+    assert tuple(topk_ids.shape) == (ntok, topk)
+    assert tuple(topk_weights.shape) == (ntok, topk)
+
+    ranks = context.world_size
+    experts_per_rank = context.num_experts // ranks
+    intermediate = context.intermediate_size
+    nl1n = intermediate // 64
+    l1_n = 2 * intermediate
+    l2_n = hidden
+    nl2n = hidden // block_n
+    nk1 = hidden // block_k
+    nk2 = intermediate // block_k
+    pool_tokens = context.pool_tokens
+    # These are kernel layout requirements. Communication buffers and scratch
+    # capacities are part of MegaMoEContext's caller-owned contract.
+    assert input_fp8.dtype == torch.float8_e4m3fn and input_fp8.is_contiguous()
+    assert input_scales.dtype == torch.float32 and input_scales.is_contiguous()
+    assert topk_ids.dtype in (torch.int32, torch.int64) and topk_ids.is_contiguous()
+    assert topk_weights.dtype == torch.float32 and topk_weights.is_contiguous()
+    assert w1.dtype == torch.float8_e4m3fn and w1.is_contiguous()
+    assert w1_scales.dtype == torch.float32 and w1_scales.is_contiguous()
+    assert w2.dtype == torch.float8_e4m3fn and w2.is_contiguous()
+    assert w2_scales.dtype == torch.float32 and w2_scales.is_contiguous()
+    assert all(
+        tensor.device == device
+        for tensor in (
+            input_scales,
+            topk_ids,
+            topk_weights,
+            w1,
+            w1_scales,
+            w2,
+            w2_scales,
         )
-        shared, local = dataset["shared"], dataset["local"]
-        topk_all = shared["topk_idx"].reshape(R, routes).contiguous()
-        tok_all = fp8_from_uint8(shared["input_fp8_bits"], torch)
-        sf_all = shared["input_scales"].contiguous()
-        w_all = shared["topk_weights"].reshape(R, routes).contiguous()
-        # Checkpoints store [all gate rows | all up rows].  SM90 WGMMA consumes
-        # [gate 0:8 | up 0:8 | gate 8:16 | up 8:16 | ...].  This transform is
-        # part of the kernel's host preprocessing contract, not a test adapter.
-        w1_q = fp8_from_uint8(
-            interleave_l1_gate_up_rows(local["l1_weight_fp8_bits"], torch),
-            torch,
-        ).to(dev)
-        w1_sf = local["l1_weight_scale_inv"].to(dev).contiguous()
-        w2_q = fp8_from_uint8(local["l2_weight_fp8_bits"], torch).to(dev)
-        w2_sf = local["l2_weight_scale_inv"].to(dev).contiguous()
+    )
+    assert tuple(w1.shape) == (experts_per_rank, l1_n, hidden)
+    assert tuple(w1_scales.shape) == (experts_per_rank, nl1n, nk1)
+    assert tuple(w2.shape) == (experts_per_rank, l2_n, intermediate)
+    assert tuple(w2_scales.shape) == (experts_per_rank, nl2n, nk2)
+
+    if output is None:
+        output = torch.empty(
+            (ntok, hidden),
+            dtype=torch.bfloat16,
+            device=device,
+        )
     else:
-        g = torch.Generator(device="cpu").manual_seed(1234)
-        # Routing must match the baselines we compare against. `bench_mega_moe_sm90.py`
-        # (and the horizontal sweep) use topk-of-random-scores -> TOPK distinct experts.
-        _scores = torch.randn(R * NTOK, NEXP, generator=g)
-        topk_all = torch.topk(_scores, TOPK, dim=-1, largest=True, sorted=False).indices
-        topk_all = topk_all.reshape(R, routes).contiguous()
-        if DROP > 0:
-            topk_all[torch.rand(R, routes, generator=g) < DROP] = -1
-        tok_all = (torch.randn(R, NTOK, K, generator=g) * 0.5).to(f8)
-        sf_all = (torch.rand(R, NTOK, NSF, generator=g) * 0.5 + 0.5).contiguous()
-        w_all = (torch.rand(R, routes, generator=g) * 0.8 + 0.2).contiguous()
-        gg = torch.Generator(device=dev).manual_seed(9000 + rank)
-        w1_q = interleave_l1_gate_up_rows(
-            (torch.randn(EPR, L1_N, K, generator=gg, device=dev) * 0.4).to(f8),
-            torch,
-        )
-        w1_sf = (
-            torch.rand(EPR, NL1N, NK1, generator=gg, device=dev) * 0.4 + 0.3
-        ).contiguous()
-        w2_q = (torch.randn(EPR, L2_N, INTER, generator=gg, device=dev) * 0.4).to(f8)
-        w2_sf = (
-            torch.rand(EPR, NL2N, NK2, generator=gg, device=dev) * 0.4 + 0.3
-        ).contiguous()
-    assert tuple(w1_q.shape) == (EPR, L1_N, K)
-    # Match the checkpoint/UserHopper W1 SF contract exactly. CUDA stores ONE
-    # scalar per (128-row weight block, 128-K block); with the gate/up gran-8
-    # interleave a BLOCK_N=128 tile spans 64 gate cols + 64 up cols that all
-    # share their block's scalar.  The checkpoint layout is [E, NL1N, NK1]:
-    # the first NL1N/2 rows are gate SF and the second NL1N/2 rows are up SF.
-    # Therefore gate_sf_n=n_block/2 and up_sf_n=NL1N/2+n_block/2.
-    assert tuple(w1_sf.shape) == (EPR, NL1N, NK1)
-    # v7: L2 is one scalar per (BLOCK_N, BLOCK_K) tile -- cuh:927.
+        assert output.device == device
+        assert output.dtype == torch.bfloat16 and output.is_contiguous()
+        assert tuple(output.shape) == (ntok, hidden)
 
-    # The host computes only the workspace size. Dispatch and expert scheduling
-    # remain inside the persistent kernel.
-    tk = topk_all.tolist()
-    counts = [[[0 for _ in range(R)] for _ in range(EPR)] for _ in range(R)]
-    for src in range(R):
-        for e in tk[src]:
-            if e >= 0:
-                counts[e // EPR][e % EPR][src] += 1
-    peak_recv = max(
-        counts[o][le][src] for o in range(R) for le in range(EPR) for src in range(R)
-    )
-    assert peak_recv <= MAX_RECV
-    n_le = [[sum(counts[o][le]) for le in range(EPR)] for o in range(R)]
-    blocks = [[(n + BLOCK_M - 1) // BLOCK_M for n in n_le[o]] for o in range(R)]
-    NPB = max(sum(blocks[o]) for o in range(R))
-    POOL_TOKENS = max(NPB * BLOCK_M, BLOCK_M)
-
-    # ---- symmetric heap ----
-    def sym(nbytes):
-        p = lib.nvshmem_alloc_bytes_wrapper(int(nbytes))
-        assert p
-        return p
-
-    tok_b = sym(NTOK * K)
-    sf_b = sym(NTOK * NSF * 4)
-    w_b = sym(routes * 4)
-    q_b = sym(EPR * R * MAX_RECV * 4)
-    recv_b = sym(R * EPR * 8)
-    rsum_b = sym(EPR * 8)
-    cb_b = sym(TOPK * NTOK * K * 2)
-    sig_b = sym(16 * 4)
-    meta_b = sym(POOL_TOKENS * 3 * 4)
-
-    def peers(base):
-        vals = []
-        for pe in range(R):
-            p = (
-                base
-                if pe == rank
-                else lib.nvshmem_ptr_wrapper(ctypes.c_void_p(base), pe)
-            )
-            assert p
-            vals.append(int(p))
-        return torch.tensor(vals, device=dev, dtype=torch.int64)
-
-    tok_tab, sf_tab, w_tab = peers(tok_b), peers(sf_b), peers(w_b)
-    q_tab, recv_tab, rsum_tab = peers(q_b), peers(recv_b), peers(rsum_b)
-    cb_tab, sig_tab, meta_tab = peers(cb_b), peers(sig_b), peers(meta_b)
-
-    BLK = 1024
-
-    def zero(tab, nb):
-        sym_zero[(triton.cdiv(nb, BLK),)](tab, rank, nb, BLOCK=BLK)
-
-    def h2d(t, tab):
-        b = t.contiguous().view(-1).view(torch.int8).to(dev)
-        sym_h2d[(triton.cdiv(b.numel(), BLK),)](b, tab, rank, b.numel(), BLOCK=BLK)
-
-    for tab, nb in (
-        (q_tab, EPR * R * MAX_RECV * 4),
-        (recv_tab, R * EPR * 8),
-        (rsum_tab, EPR * 8),
-        (cb_tab, TOPK * NTOK * K * 2),
-        (sig_tab, 16 * 4),
-        (meta_tab, POOL_TOKENS * 3 * 4),
-    ):
-        zero(tab, nb)
-    h2d(tok_all[rank], tok_tab)
-    h2d(sf_all[rank], sf_tab)
-    h2d(w_all[rank], w_tab)
-    torch.cuda.synchronize()
-    lib.nvshmemx_barrier_wrapper(
-        ctypes.c_void_p(torch.cuda.current_stream().cuda_stream)
-    )
-    torch.cuda.synchronize()
-
-    # ---- local tensors ----
-    topk_local = topk_all[rank].to(dev)
-    sm_ec = torch.full((NUM_SMS * NEXP,), -1, device=dev, dtype=torch.int32)
-    send = torch.zeros((NEXP,), device=dev, dtype=torch.int64)
-    arrival = torch.zeros((max(NPB, 1),), device=dev, dtype=torch.int32)
-    l2_mask = torch.zeros((max(NPB, 1),), device=dev, dtype=torch.int64)
-    gctr = torch.zeros((8,), device=dev, dtype=torch.int32)
-    meta_ready = torch.zeros((NUM_SMS,), device=dev, dtype=torch.int32)
-    l1_tok = torch.zeros((POOL_TOKENS, K), device=dev, dtype=f8)
-    l1_sf = torch.zeros((NSF * POOL_TOKENS,), device=dev, dtype=torch.float32)
-    l1_w = torch.zeros((POOL_TOKENS,), device=dev, dtype=torch.float32)
-    l2_acts = torch.zeros((POOL_TOKENS, INTER), device=dev, dtype=f8)
-    l2_sf = torch.zeros((NL1N * POOL_TOKENS,), device=dev, dtype=torch.float32)
-    final_y = torch.zeros((NTOK, K), device=dev, dtype=torch.bfloat16)
-
-    def _alloc_fn(size: int, align: int, stream):
-        return torch.empty(size, device=dev, dtype=torch.int8)
-
-    triton.set_allocator(_alloc_fn)
+    peer_tokens = tuple(int(pointer) for pointer in context.token_peer_ptrs)
+    assert len(peer_tokens) == ranks
+    assert all(pointer != 0 for pointer in peer_tokens)
+    peer_tokens = (peer_tokens + (peer_tokens[0],) * 8)[:8]
 
     a1_desc = TensorDescriptor(
-        l1_tok, shape=[POOL_TOKENS, K], strides=[K, 1], block_shape=[BLOCK_M, BLOCK_K]
+        context.l1_tokens,
+        shape=[pool_tokens, hidden],
+        strides=[hidden, 1],
+        block_shape=[block_m, block_k],
     )
-    # v4: fp8 wgmma wants B N-major, which is w1_q's NATIVE layout -- no permute.
-    w1_nk = w1_q.contiguous()  # [EPR, L1_N, K]  N-major
     b1_desc = TensorDescriptor(
-        w1_nk.view(EPR * L1_N, K),
-        shape=[EPR * L1_N, K],
-        strides=[K, 1],
-        block_shape=[BLOCK_N, BLOCK_K],
+        w1.view(experts_per_rank * l1_n, hidden),
+        shape=[experts_per_rank * l1_n, hidden],
+        strides=[hidden, 1],
+        block_shape=[block_n, block_k],
     )
     a2_desc = TensorDescriptor(
-        l2_acts,
-        shape=[POOL_TOKENS, INTER],
-        strides=[INTER, 1],
-        block_shape=[BLOCK_M, BLOCK_K],
+        context.l2_activations,
+        shape=[pool_tokens, intermediate],
+        strides=[intermediate, 1],
+        block_shape=[block_m, block_k],
     )
-    l1_st_desc = TensorDescriptor(
-        l2_acts,
-        shape=[POOL_TOKENS, INTER],
-        strides=[INTER, 1],
-        block_shape=[BLOCK_M // 2, BLOCK_N // 2],
-    )  # v32: L1 async TMA store
-    w2_nk = w2_q.contiguous()  # [EPR, L2_N, INTER]  N-major
+    l1_store_desc = TensorDescriptor(
+        context.l2_activations,
+        shape=[pool_tokens, intermediate],
+        strides=[intermediate, 1],
+        block_shape=[block_m // 2, block_n // 2],
+    )
     b2_desc = TensorDescriptor(
-        w2_nk.view(EPR * L2_N, INTER),
-        shape=[EPR * L2_N, INTER],
-        strides=[INTER, 1],
-        block_shape=[BLOCK_N, BLOCK_K],
+        w2.view(experts_per_rank * l2_n, intermediate),
+        shape=[experts_per_rank * l2_n, intermediate],
+        strides=[intermediate, 1],
+        block_shape=[block_n, block_k],
     )
-    # SF is MN-major -> a block's SF tile is BLOCK_M contiguous floats: a real TMA box
     sfa1_desc = TensorDescriptor(
-        l1_sf.view(NSF, POOL_TOKENS),
-        shape=[NSF, POOL_TOKENS],
-        strides=[POOL_TOKENS, 1],
-        block_shape=[1, BLOCK_M],
+        context.l1_scales.view(-1)[: num_sf * pool_tokens].view(num_sf, pool_tokens),
+        shape=[num_sf, pool_tokens],
+        strides=[pool_tokens, 1],
+        block_shape=[1, block_m],
     )
     sfa2_desc = TensorDescriptor(
-        l2_sf.view(NL1N, POOL_TOKENS),
-        shape=[NL1N, POOL_TOKENS],
-        strides=[POOL_TOKENS, 1],
-        block_shape=[2, BLOCK_M],
+        context.l2_scales.view(-1)[: nl1n * pool_tokens].view(nl1n, pool_tokens),
+        shape=[nl1n, pool_tokens],
+        strides=[pool_tokens, 1],
+        block_shape=[2, block_m],
     )
 
-    lib.nvshmemx_barrier_wrapper(
-        ctypes.c_void_p(torch.cuda.current_stream().cuda_stream)
+    _fill_tensor_bytes(context.expert_send_count, 0)
+    _fill_tensor_bytes(context.l1_arrival_count, 0)
+    _fill_tensor_bytes(context.l2_arrival_mask, 0)
+    _fill_tensor_bytes(context.global_counters, 0)
+    _fill_tensor_bytes(context.metadata_ready, 0)
+    _fill_tensor_bytes(context.sm_expert_count, -1)
+    _zero_symmetric(
+        context.recv_count_ptrs,
+        context.rank,
+        ranks * experts_per_rank * 8,
     )
-    torch.cuda.synchronize()
+    _zero_symmetric(context.recv_sum_ptrs, context.rank, experts_per_rank * 8)
+    _zero_symmetric(context.signal_ptrs, context.rank, 16 * 4)
+    _stage_symmetric(input_fp8, context.token_ptrs, context.rank)
+    _stage_symmetric(input_scales, context.scale_ptrs, context.rank)
+    _stage_symmetric(topk_weights, context.route_weight_ptrs, context.rank)
 
-    kargs = dict(
-        MY_PE=rank,
-        NPES=R,
-        NUM_SMS=NUM_SMS,
-        NTOK=NTOK,
-        TOPK=TOPK,
-        NEXP=NEXP,
-        EPR=EPR,
-        EPR_POW2=EPR_POW2,
-        R_POW2=R_POW2,
-        EPW=EPW,
-        MAX_RECV=MAX_RECV,
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
-        BLOCK_K=BLOCK_K,
-        K=K,
-        INTER=INTER,
-        L1_N=L1_N,
-        L2_N=L2_N,
-        NK1=NK1,
-        NK2=NK2,
-        NL1N=NL1N,
-        NL2N=NL2N,
-        L1_OUT_N=L1_OUT_N,
-        NPAIR=NPAIR,
-        NSF=NSF,
-        POOL_TOKENS=POOL_TOKENS,
-        NEXP_POW2=NEXP_POW2,
-        K_POW2=K_POW2,
-        NSF_POW2=NSF_POW2,
-        BLOCK_R=BLOCK_R,
-        ITERS=ITERS,
-        STAGES=STAGES,
-        USE_L2_TMA=(USE_L2_TMA != 0),
-        USE_L1_STORE_PIPE=(USE_L1_STORE_PIPE != 0),
-        # Keep the integer diagnostic level: 0=live v23 control, 1=init-only,
-        # 2=full D8 raw load+store. Booleanizing this silently dropped level 2.
-        USE_D8_TMA1D=USE_D8_TMA1D,
-        USE_SMEM_EXPERT_COUNT=(USE_SMEM_EXPERT_COUNT != 0),
-        FAST_NVLINK_BARRIER=(FAST_NVLINK_BARRIER != 0),
-        D8_PULL_STREAMS=D8_PULL_STREAMS,
-        DISPATCH_WARPS=2,
-        MATH_WARPS=4,
-        num_warps=LOADER_WARPS,
-    )
-    # v21: NPES peer token-buffer bases as direct int kernel-args (div=16 specialized
-    # -> wide coalesced LDG), padded to 8; the where-chain in dispatch picks by src_rank.
-    _tp = (tok_tab.tolist() + [int(tok_tab[0])] * 8)[:8]
-    pos = (
-        topk_local,
-        tok_tab,
-        sf_tab,
-        w_tab,
-        q_tab,
-        recv_tab,
-        rsum_tab,
-        sig_tab,
-        meta_tab,
-        cb_tab,
-        cb_b,
-        sm_ec,
-        send,
-        arrival,
-        l2_mask,
-        gctr,
-        meta_ready,
-        l1_tok,
-        l1_sf,
-        l1_w,
-        l2_acts,
-        l2_sf,
-        w1_sf,
-        w2_sf,
-        final_y,
+    stream = torch.cuda.current_stream(device)
+    context.barrier_all_on_stream(stream)
+
+    routes = ntok * topk
+    iters = triton.cdiv(routes, context.num_sms * block_r)
+    r_pow2 = 1 << (ranks - 1).bit_length()
+    epr_pow2 = 1 << (experts_per_rank - 1).bit_length()
+    nexp_pow2 = 1 << (context.num_experts - 1).bit_length()
+    hidden_pow2 = 1 << (hidden - 1).bit_length()
+    nsf_pow2 = 1 << (num_sf - 1).bit_length()
+
+    ws_megakernel[(context.num_sms,)](
+        topk_ids,
+        context.token_ptrs,
+        context.scale_ptrs,
+        context.route_weight_ptrs,
+        context.queue_ptrs,
+        context.recv_count_ptrs,
+        context.recv_sum_ptrs,
+        context.signal_ptrs,
+        context.metadata_ptrs,
+        context.combine_ptrs,
+        context.combine_local,
+        context.sm_expert_count,
+        context.expert_send_count,
+        context.l1_arrival_count,
+        context.l2_arrival_mask,
+        context.global_counters,
+        context.metadata_ready,
+        context.l1_tokens,
+        context.l1_scales,
+        context.l1_weights,
+        context.l2_activations,
+        context.l2_scales,
+        w1_scales,
+        w2_scales,
+        output,
         a1_desc,
         b1_desc,
         a2_desc,
         b2_desc,
         sfa1_desc,
         sfa2_desc,
-        *_tp,
-        l1_st_desc,
+        *peer_tokens,
+        l1_store_desc,
+        USE_D8_TMA1D=2,
+        USE_L1_STORE_PIPE=False,
+        USE_SMEM_EXPERT_COUNT=True,
+        FAST_NVLINK_BARRIER=True,
+        D8_PULL_STREAMS=2,
+        MY_PE=context.rank,
+        NPES=ranks,
+        NUM_SMS=context.num_sms,
+        NTOK=ntok,
+        TOPK=topk,
+        NEXP=context.num_experts,
+        EPR=experts_per_rank,
+        EPR_POW2=epr_pow2,
+        R_POW2=r_pow2,
+        EPW=min(8, experts_per_rank),
+        MAX_RECV=context.max_recv,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        BLOCK_K=block_k,
+        K=hidden,
+        INTER=intermediate,
+        L1_N=l1_n,
+        L2_N=l2_n,
+        NK1=nk1,
+        NK2=nk2,
+        NL1N=nl1n,
+        NL2N=nl2n,
+        L1_OUT_N=block_n // 2,
+        NPAIR=block_n // 16,
+        NSF=num_sf,
+        POOL_TOKENS=pool_tokens,
+        NEXP_POW2=nexp_pow2,
+        K_POW2=hidden_pow2,
+        NSF_POW2=nsf_pow2,
+        BLOCK_R=block_r,
+        ITERS=iters,
+        STAGES=stages,
+        DISPATCH_WARPS=2,
+        MATH_WARPS=4,
+        num_warps=LOADER_WARPS,
     )
 
-    def reset():
-        send.zero_()
-        arrival.zero_()
-        l2_mask.zero_()
-        gctr.zero_()
-        meta_ready.zero_()
-        sm_ec.fill_(-1)
-        zero(recv_tab, R * EPR * 8)
-        zero(rsum_tab, EPR * 8)
-        zero(sig_tab, 16 * 4)
-
-    def barrier():
-        torch.cuda.synchronize()
-        lib.nvshmemx_barrier_wrapper(
-            ctypes.c_void_p(torch.cuda.current_stream().cuda_stream)
-        )
-        torch.cuda.synchronize()
-
-    reset()
-    barrier()
-    ws_megakernel[(NUM_SMS,)](*pos, **kargs)
-    barrier()
-
-    bench_us = None
-
-    if BENCH:
-        times = []
-
-        def timed_launch():
-            reset()
-            barrier()
-            e0, e1 = torch.cuda.Event(True), torch.cuda.Event(True)
-            # The blocking host-side barrier above makes state visible but lets
-            # Python process scheduling skew the subsequent launches by hundreds
-            # of microseconds.  An optional second barrier is enqueued on the GPU
-            # stream; e0 and the kernel sit behind it, so all ranks begin the
-            # measured interval only after every stream has arrived.
-            if GPU_START_BARRIER:
-                lib.nvshmemx_barrier_wrapper(
-                    ctypes.c_void_p(torch.cuda.current_stream().cuda_stream)
-                )
-            e0.record()
-            ws_megakernel[(NUM_SMS,)](*pos, **kargs)
-            e1.record()
-            torch.cuda.synchronize()
-            elapsed = e0.elapsed_time(e1) * 1e3
-            barrier()
-            return elapsed
-
-        for i in range(BENCH_WARMUP + BENCH_ITERS):
-            candidate_elapsed = timed_launch()
-            if i >= BENCH_WARMUP:
-                times.append(candidate_elapsed)
-        if BENCH_REDUCE == "mean":
-            bench_us = sum(times) / len(times)
-        else:
-            times.sort()
-            bench_us = times[len(times) // 2]
-
-    if BENCH:
-        print(
-            f"[rank {rank}/{R}] BENCH | {bench_us:.1f} us",
-            flush=True,
-        )
-        lib.nvshmemx_barrier_wrapper(
-            ctypes.c_void_p(torch.cuda.current_stream().cuda_stream)
-        )
-        torch.cuda.synchronize()
-        lib.nvshmem_finalize_wrapper()
-        return 0
-
-    lib.nvshmemx_barrier_wrapper(
-        ctypes.c_void_p(torch.cuda.current_stream().cuda_stream)
-    )
-    torch.cuda.synchronize()
-    lib.nvshmem_finalize_wrapper()
-    return 0
-
-
-def main(config: MegaMoEConfig = CONFIG) -> int:
-    if config.worker:
-        return run_worker(config)
-    return launch_megamoe_cli(config)
-
-
-if __name__ == "__main__":
-    sys.exit(main())
+    context.barrier_all_on_stream(stream)
+    return output

@@ -12,4 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Triton/TLE Hopper MegaMoE production-shape candidate."""
+"""Triton/TLE Hopper MegaMoE operator."""
+
+from .api import MegaMoEContext, megamoe_fp8
+
+__all__ = ["MegaMoEContext", "megamoe_fp8"]

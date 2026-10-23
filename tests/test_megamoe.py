@@ -12,46 +12,26 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for the MegaMoE data-layout contract."""
+"""Tests for the public Hopper MegaMoE entry point."""
 
 import pytest
 import torch
 
-from flaggems_vllm.runtime.backend._nvidia.hopper.mega.megamoe.qwen3_fp8_shared_data import (
-    interleave_l1_gate_up_rows,
+import flaggems_vllm
+from flaggems_vllm.runtime.backend._nvidia.hopper.ops import megamoe as hopper_megamoe
+from flaggems_vllm.utils.triton_version_utils import has_triton_tle
+
+pytestmark = pytest.mark.megamoe
+
+
+def _is_hopper():
+    return torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 9
+
+
+@pytest.mark.skipif(
+    not (_is_hopper() and has_triton_tle(3, 6, 0)),
+    reason="requires Hopper with FlagTree TLE",
 )
-
-MEGAMOE_LAYOUT_CONFIGS = [
-    # (num_experts, rows, hidden_size)
-    (1, 32, 1),
-    (2, 64, 3),
-]
-
-
-def _reference_interleave(weight):
-    granularity = 8
-    half = weight.shape[1] // 2
-    chunks = []
-    for offset in range(0, half, granularity):
-        chunks.extend(
-            (
-                weight[:, offset : offset + granularity],
-                weight[:, half + offset : half + offset + granularity],
-            )
-        )
-    return torch.cat(chunks, dim=1)
-
-
-@pytest.mark.megamoe
-@pytest.mark.parametrize("config", MEGAMOE_LAYOUT_CONFIGS)
-def test_megamoe_w1_layout(config):
-    experts, rows, hidden = config
-    source = torch.arange(experts * rows * hidden, dtype=torch.uint8).reshape(
-        experts, rows, hidden
-    )
-
-    actual = interleave_l1_gate_up_rows(source, torch)
-    expected = _reference_interleave(source)
-
-    assert torch.equal(actual, expected)
-    assert actual.is_contiguous()
+def test_megamoe_fp8_is_exported_on_hopper():
+    assert callable(hopper_megamoe.megamoe_fp8)
+    assert flaggems_vllm.megamoe_fp8 is hopper_megamoe.megamoe_fp8
