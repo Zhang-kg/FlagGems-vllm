@@ -149,7 +149,7 @@ class _StandaloneNvshmem:
     def barrier_all_on_stream(self, stream: torch.cuda.Stream) -> None:
         # The operator calls this once immediately before and once immediately
         # after the megakernel. Place events inside those barriers so setup and
-        # teardown remain outside the historical kernel-only timing interval.
+        # teardown remain outside the kernel-only timing interval.
         if self._timing_events is not None and self._timing_barriers == 1:
             self._timing_events[1].record(stream)
         self.library.nvshmemx_barrier_all_on_stream(ctypes.c_void_p(stream.cuda_stream))
@@ -410,7 +410,6 @@ def _make_context(config: _BenchmarkConfig, runtime, pool_tokens):
         metadata_ptrs=tables[8],
         combine_local=pointers[6],
         token_peer_ptrs=runtime.peer_addresses(pointers[0]),
-        sm_expert_count=local(num_sms * config.num_experts, dtype=torch.int32),
         expert_send_count=local(config.num_experts, dtype=torch.int64),
         l1_arrival_count=local(pool_tokens // 128, dtype=torch.int32),
         l2_arrival_mask=local(pool_tokens // 128, dtype=torch.int64),

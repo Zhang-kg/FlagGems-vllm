@@ -111,7 +111,7 @@ __device__ __forceinline__ void d8_unified_dispatch_pull_impl(
     return;
   const unsigned stream = warp_in_partition;
 
-  //! 每个stream绑定自己的SMEM token buffer和mbarrier
+  // Each stream owns one SMEM token buffer and one mbarrier.
   const uint64_t stage_addr = stream == 0 ? stage0_addr : stage1_addr;
   const uint64_t state_addr = stream == 0 ? state0_addr : state1_addr;
   const unsigned stage = static_cast<unsigned>(__cvta_generic_to_shared(
@@ -148,8 +148,7 @@ __device__ __forceinline__ void d8_unified_dispatch_pull_impl(
   unsigned phase = 0;
   const unsigned sm_idx = blockIdx.x;
   const unsigned stream_count = 2u;
-  //! 分配任务，确定token_idx，之后每次增加NUM_SMS *
-  //! 2。这个token_idx是当前rank接收到所有route，并按照expert排序之后的token_idx
+  // Distribute expert-sorted routes across two streams on every SM.
   unsigned token_idx = sm_idx * stream_count + stream;
   int current_expert = -1;
   unsigned expert_start = 0;
@@ -157,8 +156,7 @@ __device__ __forceinline__ void d8_unified_dispatch_pull_impl(
   unsigned pool_block = 0;
 
   while (true) {
-    //! 利用rsum[current_expert]找到当前token_idx属于哪个local
-    //! expert，以及它在local expert中的位置
+    // Locate the local expert and the route's offset within that expert.
     while (token_idx >= expert_end) {
       if (++current_expert >= experts_per_rank)
         break;
@@ -171,19 +169,14 @@ __device__ __forceinline__ void d8_unified_dispatch_pull_impl(
     if (current_expert >= experts_per_rank)
       break;
 
-    // PR787 always-inlines raw regions and loses LLVM convergent attributes.
-    // Do not use __reduce/__ballot/__shfl here: under branch-scoped WS those
-    // intrinsics become REDUX/BRA.DIV with an invalid convergence token.  The
-    // rank dimension is <=8, so all lanes redundantly execute the same scalar
-    // scan, matching the already-proven TleD8SelectRouteWarp helper.
+    // Raw regions lose convergent attributes when inlined. Avoid warp vote and
+    // shuffle intrinsics here because branch-scoped warp specialization can
+    // assign them an invalid convergence token. With at most eight ranks, a
+    // redundant scalar scan in every lane remains inexpensive.
     unsigned remaining[8];
-//! 选择source
-//! rank，读取recv[source_rank][expert]，按照CUDA相同的round-robin规则计算这个route来自哪个rank，是该rank
-//! queue中的第几个route
+    // Select the source rank and queue slot with the dispatch round-robin rule.
 #pragma unroll
     for (unsigned rank = 0; rank < 8; ++rank) {
-      // TODO 这里的ramining[rank]得到的是rank发送给当前GPU的current
-      // expert的route数量
       remaining[rank] =
           rank < static_cast<unsigned>(num_ranks)
               ? static_cast<unsigned>(
@@ -209,9 +202,7 @@ __device__ __forceinline__ void d8_unified_dispatch_pull_impl(
       if (num_active == 0)
         break;
       const unsigned round_tokens = length * num_active;
-      //! 这一轮拷贝数据：每个active rank拷贝length个route，length是所有active
-      //! rank中最少发送route数量（木桶的短板），拷贝的过程是round
-      //! robin的方式从每个active rank中拷贝一个route slot
+      // Consume an equal prefix from every active rank in round-robin order.
       if (slot < round_tokens) {
         const unsigned source_order = slot % num_active;
         unsigned active_order = 0;
@@ -226,8 +217,7 @@ __device__ __forceinline__ void d8_unified_dispatch_pull_impl(
         token_in_rank = offset + slot / num_active;
         break;
       }
-      //! 另外一个情况，slot不在这一轮拷贝的数据中，减去round_tokens重新开始计算slot；上一轮每个active
-      //! rank拷贝了length个route，更新length和remaining
+      // Advance past the completed round and continue with remaining routes.
       slot -= round_tokens;
       offset += length;
 #pragma unroll
@@ -235,13 +225,12 @@ __device__ __forceinline__ void d8_unified_dispatch_pull_impl(
         remaining[rank] -= remaining[rank] < length ? remaining[rank] : length;
     }
 
-    //! 从queue[local_expert][source_rank][slot]中读取原始的route id
+    // Read the original route ID from the source-rank queue.
     const unsigned q_offset = (static_cast<unsigned>(current_expert) *
                                    static_cast<unsigned>(num_ranks) +
                                src_rank) *
                                   static_cast<unsigned>(max_recv) +
                               token_in_rank;
-    //! 原始route id
     const int source_token_topk = queue[q_offset];
     const unsigned source_token =
         static_cast<unsigned>(source_token_topk / topk);
@@ -263,7 +252,7 @@ __device__ __forceinline__ void d8_unified_dispatch_pull_impl(
     const auto *source = reinterpret_cast<const unsigned char *>(
                              static_cast<uintptr_t>(token_base)) +
                          static_cast<uint64_t>(source_token) * hidden;
-    //! 搬运数据，lane0发射TMA
+    // Lane 0 issues the remote token TMA load.
     if (lane == 0) {
       tma_load_1d(stage, source, barrier, hidden);
     }
@@ -272,13 +261,13 @@ __device__ __forceinline__ void d8_unified_dispatch_pull_impl(
     const uint64_t sf_base = sf_table[src_rank];
     const auto *remote_sf =
         reinterpret_cast<const float *>(static_cast<uintptr_t>(sf_base));
-    //! 32个lane普通load/store复制SF
+    // All lanes copy activation scales with regular loads and stores.
     for (unsigned col = lane; col < static_cast<unsigned>(num_sf); col += 32)
       l1_sf[col * static_cast<unsigned>(pool_tokens) + pool_token] =
           remote_sf[source_token * static_cast<unsigned>(num_sf) + col];
     __syncwarp();
 
-    //! lane 0 复制该route的topk weight
+    // Lane 0 copies the route's top-k weight.
     if (lane == 0) {
       const uint64_t weight_base = weight_table[src_rank];
       const auto *remote_weight =
@@ -288,7 +277,7 @@ __device__ __forceinline__ void d8_unified_dispatch_pull_impl(
     __syncwarp();
 
     auto *destination = l1_token + static_cast<uint64_t>(pool_token) * hidden;
-    //! 等待TMA load完成，lane0发射TMA store，保存到本地L1 token pool
+    // Wait for the load, then store the token into the local L1 pool.
     if (lane == 0) {
       mbarrier_arrive_expect_tx(barrier, hidden);
       mbarrier_wait(barrier, phase);
@@ -296,9 +285,7 @@ __device__ __forceinline__ void d8_unified_dispatch_pull_impl(
     }
     __syncwarp();
 
-    //! lane0 保存src_rank/source_token/source_topk metadata；等待TMA
-    //! store完成；对对应的l1_arrival_count执行release atomic,
-    //! 通知loader该token已经可用
+    // Publish route metadata and notify the loader after the TMA store completes.
     if (lane == 0) {
       metadata[pool_token * 3u + 0u] = static_cast<int>(src_rank);
       metadata[pool_token * 3u + 1u] = static_cast<int>(source_token);

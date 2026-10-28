@@ -146,30 +146,20 @@ def dispatch_nvlink_barrier(
     NPES: tl.constexpr,
     NUM_SMS: tl.constexpr,
     USE_D8_TMA1D: tl.constexpr,
-    FAST_NVLINK_BARRIER: tl.constexpr,
 ):
-    # D3 already performed a rank-wide grid sync.  CUDA therefore calls the
-    # pre-pull NVLink barrier with sync_prologue=false and has the first NPES
-    # threads signal peers concurrently.  Keep the old path as the A/B control.
+    # D3 already performed a rank-wide grid sync, so the first NPES threads can
+    # signal peers concurrently without another prologue barrier.
     dispatch_sync(USE_D8_TMA1D)
     fence_sys()
-    if not FAST_NVLINK_BARRIER:
-        dispatch_rank_barrier(ctr, NUM_SMS, USE_D8_TMA1D)
     if sm_idx == 0:
-        if FAST_NVLINK_BARRIER:
-            pe = tl.arange(0, 8)
-            tl.atomic_add(
-                peer_i32(sig_tab, pe) + slot,
-                1,
-                mask=pe < NPES,
-                sem="release",
-                scope="sys",
-            )
-        else:
-            for pe in tl.static_range(0, NPES):
-                tl.atomic_add(
-                    peer_i32(sig_tab, pe) + slot, 1, sem="release", scope="sys"
-                )
+        pe = tl.arange(0, 8)
+        tl.atomic_add(
+            peer_i32(sig_tab, pe) + slot,
+            1,
+            mask=pe < NPES,
+            sem="release",
+            scope="sys",
+        )
         sl = peer_i32(sig_tab, MY_PE)
         v = tl.atomic_add(sl + slot, 0, sem="acquire", scope="sys")
         while v < NPES:
@@ -191,7 +181,7 @@ def nvlink_barrier(
     fence_sys()
     rank_barrier(ctr, NUM_SMS)
     if sm_idx == 0:
-        # v208: match UserHopper's one-thread-per-peer signal ownership.
+        # Assign one signaling thread to each peer.
         pe = tl.arange(0, 8)
         tl.atomic_add(
             peer_i32(sig_tab, pe) + slot, 1, mask=pe < NPES, sem="release", scope="sys"
@@ -221,7 +211,7 @@ def pool_layout(rsum, EPR: tl.constexpr, EPR_POW2: tl.constexpr, BLOCK_M: tl.con
 
 
 @triton.jit
-def pick(vec, idx, EPR_POW2: tl.constexpr):
+def pick(vec, idx):
     """Extract one dynamic scalar without one-hot reduction lowering."""
     index = tl.full((1,), idx, tl.int32)
     return tl.reshape(tl.gather(vec, index, axis=0), ())
@@ -271,7 +261,6 @@ def loader_role(
     MY_PE: tl.constexpr,
     NUM_SMS: tl.constexpr,
     EPR: tl.constexpr,
-    EPR_POW2: tl.constexpr,
     EPW: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -381,7 +370,7 @@ def loader_role(
                             [BLOCK_M, BLOCK_K],
                             [pool_block * BLOCK_M, kb * BLOCK_K],
                         )
-                        # v220: L1 consumes one activation SF row per K=128.
+                        # L1 consumes one activation-scale row per K=128 tile.
                         tle.gpu.copy(
                             sfa1_desc,
                             slot.sfa.subslice(0, 1, 0),
@@ -440,8 +429,6 @@ def math_role(
     reader,
     cd_s,
     dst_rows_s,
-    l1o_s,
-    l1_st_desc,
     meta_ready,
     rsum_tab,
     cb_tab,
@@ -458,7 +445,6 @@ def math_role(
     w1_sf,
     w2_sf,
     WG: tl.constexpr,
-    USE_L1_STORE_PIPE: tl.constexpr,
     MY_PE: tl.constexpr,
     NPES: tl.constexpr,
     NUM_SMS: tl.constexpr,
@@ -469,8 +455,6 @@ def math_role(
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
     INTER: tl.constexpr,
-    L1_N: tl.constexpr,
-    L2_N: tl.constexpr,
     NK1: tl.constexpr,
     NK2: tl.constexpr,
     NL1N: tl.constexpr,
@@ -482,42 +466,18 @@ def math_role(
     TOPK: tl.constexpr,
     K: tl.constexpr,
     K_POW2: tl.constexpr,
-    EARLY_RELEASE: tl.constexpr,
-    PARTICIPANT_RELEASE: tl.constexpr,
-    MATH_RSUM_EARLY: tl.constexpr = False,
-    RSUM_NPES: tl.constexpr = 8,
-    PREFETCH_SFB: tl.constexpr = False,
 ):
     sm_idx = tl.program_id(0)
     rsum_l = peer_i64(rsum_tab, MY_PE)
-    if MATH_RSUM_EARLY:
-        # v168: D4's high word is the real scheduler-readiness condition.  The
-        # later per-CTA meta_ready flag is only published after the pre-pull
-        # NVLink barrier.  Once all receive counts are final, math can build its
-        # block schedule and sleep on reader.wait() until A/B are delivered.
-        expected = NUM_SMS * RSUM_NPES
-        ready_e = 0
-        while ready_e < EPR:
-            ready_status = tl.atomic_add(
-                rsum_l + ready_e, 0, sem="acquire", scope="sys"
-            )
-            while (ready_status >> 32) != expected:
-                ready_status = tl.atomic_add(
-                    rsum_l + ready_e, 0, sem="acquire", scope="sys"
-                )
-            ready_e += 1
-    else:
-        wait_flag(meta_ready + sm_idx)
+    wait_flag(meta_ready + sm_idx)
     n_vec, blk_vec, off_vec = pool_layout(rsum_l, EPR, EPR_POW2, BLOCK_M)
 
     WG_M: tl.constexpr = BLOCK_M // 2
     row_base: tl.constexpr = WG * WG_M
     offs_m = tl.arange(0, WG_M)
     offs_n = tl.arange(0, BLOCK_N)
-    # v7: gate/up are interleaved every 8 columns along N (see the L1 epilogue's
-    # reshape to (BM, NPAIR, 2, 8)). Parity of (col // 8) selects which of the
-    # two block-granular weight SFs applies -- mirrors CUDA's `(i & 1u)` on the
-    # accumulator index (cuh:1016).
+    # Gate and up projections are interleaved every eight columns. The column
+    # group parity selects the corresponding block-granular weight scale.
     _is_up = ((offs_n // 8) % 2) == 1
     meta_l = peer_i32(meta_tab, MY_PE)
 
@@ -536,7 +496,7 @@ def math_role(
                 if phase == 1:
                     f = 0
                     while (f == 0) & (cur_e < wave_end):
-                        num_m = pick(blk_vec, cur_e, EPR_POW2)
+                        num_m = pick(blk_vec, cur_e)
                         if (block_idx // NL1N) < num_m:
                             f = 1
                         else:
@@ -550,7 +510,7 @@ def math_role(
                 else:
                     f = 0
                     while (f == 0) & (cur_e < wave_end):
-                        num_m = pick(blk_vec, cur_e, EPR_POW2)
+                        num_m = pick(blk_vec, cur_e)
                         if block_idx < num_m * NL2N:
                             f = 1
                         else:
@@ -566,84 +526,39 @@ def math_role(
             m_block = block_idx // nbn
             n_block = block_idx - m_block * nbn
             block_idx += NUM_SMS
-            n_tok = pick(n_vec, cur_e, EPR_POW2)
-            pool_block = pick(off_vec, cur_e, EPR_POW2) + m_block
+            n_tok = pick(n_vec, cur_e)
+            pool_block = pick(off_vec, cur_e) + m_block
             valid_m = tl.minimum(n_tok - m_block * BLOCK_M, BLOCK_M)
             m_ok = (row_base + offs_m) < valid_m
             nk = NK1 if phase == 1 else NK2
             rows = pool_block * BLOCK_M + row_base + offs_m
 
             acc = tl.zeros((WG_M, BLOCK_N), dtype=tl.float32)
-
-            # CUDA preloads k=0 before entering the pipe wait and issues k+1
-            # after the current WGMMA, before register scaling.  That gives a
-            # weight-SF LDG the current scaling work plus the next full-barrier
-            # wait to mature.  The legacy path deliberately remains byte-for-
-            # byte selectable for matched A/B experiments.
-            if PREFETCH_SFB:
-                if phase == 1:
-                    _gn = n_block // 2
-                    # gate/up rows occupy the first/second NL1N/2 halves.
-                    sfb_g_next = tl.load(w1_sf + (cur_e * NL1N + _gn) * NK1)
-                    sfb_u_next = tl.load(w1_sf + (cur_e * NL1N + NL1N // 2 + _gn) * NK1)
-                else:
-                    sfb_g_next = tl.load(w2_sf + (cur_e * NL2N + n_block) * NK2)
-                    sfb_u_next = sfb_g_next
             for kb in tl.range(0, nk):
                 sl = reader.wait(ck).slot
                 # Weight SF stays in global memory and is loaded once per
-                # (BLOCK_N, BLOCK_K) tile.
-                # v7: block-granular weight SF. L1 needs TWO scalars (gate/up)
-                # because the gran-8 interleave puts both in one BLOCK_N tile;
-                # L2 needs ONE. This replaces a BLOCK_N-wide gather + broadcast
-                # multiply with 1-2 scalar loads (CUDA: 7.5% vs our 23.2%).
-                if PREFETCH_SFB:
-                    sfb_g = sfb_g_next
-                    sfb_u = sfb_u_next
-                else:
-                    if phase == 1:
-                        _gn = n_block // 2
-                        sfb_g = tl.load(w1_sf + (cur_e * NL1N + _gn) * NK1 + kb)
-                        sfb_u = tl.load(
-                            w1_sf + (cur_e * NL1N + NL1N // 2 + _gn) * NK1 + kb
-                        )
-                    else:
-                        sfb_g = tl.load(w2_sf + (cur_e * NL2N + n_block) * NK2 + kb)
-                        sfb_u = sfb_g
-                # DeepGEMM-style promotion: FP8 WGMMA into fp32, then apply the
-                # per-block scales to the ACCUMULATOR. The activation SF is per-64
-                # along K, so BLOCK_K=128 must be two separate K=64 dots (this is
-                # exactly why CUDA issues two SFA TMAs for L2).
-                # Plain fp8 dot -> ASYNC FP8 WGMMA (qgmma). CRITICAL: do NOT pass
-                # max_num_imprecise_acc=0 -- that forces Triton off wgmma onto slow
-                # SYNCHRONOUS fp16 mma.sync (proven in PTX: 0 wgmma / 128 mma.sync,
-                # fp8->fp16 upconvert). Each dot is a single K<=128 tile scaled
-                # separately into the fp32 acc, so wgmma's imprecise accumulation is
-                # bounded to one tile: ~1e-4 rel error, 300x below fp8's own ~3.5e-2
-                # quantization noise. Async wgmma is also what lets TMA overlap.
-                # SF is per-64-K: k-quarters 0,1 -> sf_lo ; 2,3 -> sf_hi
-                # v11: split the L1 and L2 paths. The lo/hi accumulator split
-                # exists ONLY because L2's activation SF varies per-64-K -- you
-                # cannot factor a k-varying scale out of a dot product, so K must
-                # be cut at the SF boundary. L1's activation SF is per-row over the
-                # WHOLE 128-K block (cuh:312 "L1 (BLOCK_M floats)"; cuh:967 the _hi
-                # halves are "Only used in L2"), so for L1 all four K-quarters share
-                # one scale: accumulate them into a SINGLE register set and scale
-                # once. Halves L1's scaling work, and L1 has 2.7x more k-blocks
-                # than L2 (NK1 = 4096/128 = 32 vs NK2 = 1536/128 = 12).
-                # v18: ONE K=128 tile. L1 (per-row-128 SF) reads the whole tile in a
-                # single wgmma. L2 (per-64-K SF) subslices K into two K=64 halves.
+                # (BLOCK_N, BLOCK_K) tile. L1 needs separate gate and up scales;
+                # L2 uses a single scale.
                 if phase == 1:
-                    # WG0取前64行，WG1取后64行，共享同一个B tile；BLOCK_M=128，BLOCK_K=128，BLOCK_N=128
+                    _gn = n_block // 2
+                    sfb_g = tl.load(w1_sf + (cur_e * NL1N + _gn) * NK1 + kb)
+                    sfb_u = tl.load(w1_sf + (cur_e * NL1N + NL1N // 2 + _gn) * NK1 + kb)
+                else:
+                    sfb_g = tl.load(w2_sf + (cur_e * NL2N + n_block) * NK2 + kb)
+                    sfb_u = sfb_g
+
+                # FP8 WGMMA accumulates into FP32 before applying block scales.
+                # L1 has one activation scale per K=128 tile, while L2 changes
+                # scale at K=64 and therefore uses two K=64 WGMMA operations.
+                if phase == 1:
+                    # The two math warp groups split the rows and share B.
                     acc_lo = tle.gpu.wgmma(
                         sl.a.subslice(row_base, WG_M, 0),
                         sl.b,
                         out_dtype=tl.float32,
                         trans_b=True,
                     )
-                    # v22: SFA is independent of the async accumulator. Load it
-                    # while WGMMA is in flight, as the CUDA math warpgroup does.
-                    # L1 activation scale的粒度是K=128，整个WGMMA结果只需要一个scale
+                    # The activation scale can load while WGMMA is in flight.
                     sf_lo = tl.reshape(
                         tl.load(
                             tle.gpu.local_ptr(
@@ -656,7 +571,7 @@ def math_role(
                     acc_lo = tle.gpu.wgmma_wait(0, acc_lo)
                     acc_hi = acc_lo
                 else:
-                    # v205: consume the low K=64 fragment before issuing high.
+                    # Consume the low K=64 fragment before issuing the high half.
                     HK: tl.constexpr = BLOCK_K // 2
                     a_my = sl.a.subslice(row_base, WG_M, 0)
                     acc_lo = tle.gpu.wgmma(
@@ -696,53 +611,8 @@ def math_role(
                         (WG_M,),
                     )
                     acc_hi = tle.gpu.wgmma_wait(0, acc_hi)
-                # UserHopper returns the stage immediately after
-                # warpgroup_wait<0>(), before register-only weight-SF scaling.
-                # This shortens stage ownership without changing any operand or
-                # result.  The legacy path below remains the default for v33-v40.
-                # 提前释放reader，减少stage占用
-                if EARLY_RELEASE:
-                    if PARTICIPANT_RELEASE == 2:
-                        reader.release(ck, warp_arrive=True)
-                    elif PARTICIPANT_RELEASE:
-                        reader.release(ck, participant_arrive=True)
-                    else:
-                        reader.release(ck)
-                # 如果PREFETCH_SFB=True，则提前读取下一个k-block的weight SF，减少等待时间
-                if PREFETCH_SFB & (kb + 1 < nk):
-                    if phase == 1:
-                        _gn = n_block // 2
-                        sfb_g_next = tl.load(
-                            w1_sf + (cur_e * NL1N + _gn) * NK1 + kb + 1
-                        )
-                        sfb_u_next = tl.load(
-                            w1_sf + (cur_e * NL1N + NL1N // 2 + _gn) * NK1 + kb + 1
-                        )
-                    else:
-                        sfb_g_next = tl.load(
-                            w2_sf + (cur_e * NL2N + n_block) * NK2 + kb + 1
-                        )
-                        sfb_u_next = sfb_g_next
-                # v9: fold the activation SF into the weight SF FIRST, while both
-                # are still cheap: sf_* is a [BLOCK_M] vector, sfb_* a true scalar,
-                # so each product is BLOCK_M FMULs -- not BLOCK_M*BLOCK_N.
-                #
-                # v7 wrote  acc += (acc_lo*sf_lo + acc_hi*sf_hi) * _sfb  which the
-                # compiler cannot reassociate (FP mul is not associative), so it
-                # emitted three ELEMENTWISE multiplies per accumulator element.
-                # SASS proof: v7's FMUL count was byte-identical to v5's
-                # (40,181,760) even though v7 made sfb scalar -- the scalar never
-                # got hoisted. CUDA does the same folding by hand and lands at
-                # 4,374,528 FMUL (9.2x fewer), then one FFMA per element
-                # (cuh:1016-1020: `sb = (i&1) ? up_sf : gate_sf;`
-                #                 `final_accum[i] += scale_a * sb * accum[i];`).
-                # v10: accumulate SEPARATELY. v9 wrote `acc += a*x + b*y`, and the
-                # intermediate sum blocked fusion: SASS showed FFMA 75.8M -> 38.0M
-                # with FADD 1.4M -> 39.1M (exactly offsetting) -- the compiler
-                # UNFUSED into FMUL+FADD. Two independent accumulates give one
-                # FFMA per element each, matching CUDA's per-element
-                # `final_accum[i] += scale_a * sb * accum[i]` (cuh:1017-1020).
-                # 累加到最后的FP32 accumulator
+                # Fold activation and weight scales before multiplying the
+                # accumulator so the compiler can emit fused accumulation.
                 if phase == 1:
                     w_lo = tl.where(
                         _is_up[None, :],
@@ -758,17 +628,11 @@ def math_role(
                         (sf_hi * sfb_g)[:, None],
                     )
                     acc += acc_hi * w_hi
-                if not EARLY_RELEASE:
-                    if PARTICIPANT_RELEASE == 2:
-                        reader.release(ck, warp_arrive=True)
-                    elif PARTICIPANT_RELEASE:
-                        reader.release(ck, participant_arrive=True)
-                    else:
-                        reader.release(ck)
+                reader.release(ck)
                 ck += 1
 
-            # v200: WG1 still consumes every GEMM stage and publishes L1
-            # readiness, but skips an epilogue with no rows of its own.
+            # WG1 still consumes every GEMM stage and publishes L1 readiness,
+            # but skips the epilogue when it owns no valid rows.
             do_epilogue = True
             if WG == 1:
                 do_epilogue = valid_m > row_base
@@ -781,11 +645,10 @@ def math_role(
                     gate, up = tl.split(t4)
                     gate = tl.reshape(gate, (WG_M, L1_OUT_N))
                     up = tl.reshape(up, (WG_M, L1_OUT_N))
-                    # v189: match UserHopper's approximate FTZ reciprocal path.
+                    # Match UserHopper's approximate FTZ reciprocal path.
                     sw = libdevice.fast_dividef(gate, 1.0 + tl.exp(-gate)) * up
                     weight = tl.load(l1_w + rows, mask=m_ok, other=0.0)
-                    # v198: reduce the unweighted row, then fold top-k weight into
-                    # the row scale instead of multiplying every output twice.
+                    # Fold the top-k weight into the row scale.
                     amax = tl.max(tl.abs(sw), axis=1) * tl.abs(weight)
                     scaled = amax * (1.0 / 448.0)
                     pos = scaled > 0.0
@@ -795,23 +658,11 @@ def math_role(
                     row_scale = weight * sf_inv
                     q = (sw * row_scale[:, None]).to(tl.float8e4nv)
                     cols_o = n_block * L1_OUT_N + tl.arange(0, L1_OUT_N)
-                    # v32: async TMA store pipeline for L1 output (CUDA "store pipeline").
-                    if USE_L1_STORE_PIPE:
-                        tl.store(
-                            tle.gpu.local_ptr(l1o_s.slot(WG)), q, mask=m_ok[:, None]
-                        )
-                        tle.gpu.copy(
-                            l1o_s.slot(WG),
-                            l1_st_desc,
-                            [BLOCK_M // 2, L1_OUT_N],
-                            [pool_block * BLOCK_M + row_base, n_block * L1_OUT_N],
-                        )
-                    else:
-                        tl.store(
-                            l2_acts + rows[:, None] * INTER + cols_o[None, :],
-                            q,
-                            mask=m_ok[:, None],
-                        )
+                    tl.store(
+                        l2_acts + rows[:, None] * INTER + cols_o[None, :],
+                        q,
+                        mask=m_ok[:, None],
+                    )
                     tl.store(l2_sf + n_block * POOL_TOKENS + rows, sf, mask=m_ok)
                 # Both WGs publish readiness even when WG1 skipped the heavy
                 # epilogue; the L2 producer waits for the complete bit mask.
@@ -830,14 +681,14 @@ def math_role(
                     dst_topk = tl.load(md + 2, mask=m_ok, other=0)
                     cbb = peer_bf16(cb_tab, dst_rank)  # VECTOR of peer bases
                     base = (dst_topk * NTOK + dst_tok) * K
-                    # v23: hints cannot change physical ownership of a WGMMA fragment.
+                    # Layout hints cannot change physical WGMMA fragment ownership.
                     # Materialize a linear BF16 tile plus one fully resolved remote
                     # destination per row, then let the 4 physical math warps remap it
                     # as 16 lanes/row x 8 BF16/lane.
                     dst_row = tl.cast(cbb + base + n_block * BLOCK_N, tl.uint64)
                     tl.store(tle.gpu.local_ptr(dst_rows_s.slot(WG)), dst_row, mask=m_ok)
-                    # v186: scatter consumes only valid_m_wg, so padding rows may
-                    # be materialized without a masked SMEM read/modify/write.
+                    # Scatter consumes only valid rows, so padding entries can be
+                    # materialized without a masked SMEM read/modify/write.
                     tl.store(tle.gpu.local_ptr(cd_s.slot(WG)), acc.to(tl.bfloat16))
                     cd_addr = smem_generic_addr(
                         tle.gpu.local_ptr(cd_s.slot(WG), (0, 0))
@@ -855,7 +706,7 @@ def math_role(
                         [cd_addr, dst_addr, valid_m_wg, scatter_cols, bar_wg],
                     )
 
-    # v31: only WG0 runs the cross-rank barrier + combine (per-token, tiny).
+    # Only WG0 runs the cross-rank barrier and the per-token combine step.
     if WG == 0:
         nvlink_barrier(sig_tab, 1, gctr + 3, sm_idx, MY_PE, NPES, NUM_SMS)
         cb_l = tl.multiple_of(cb_local.to(tl.pointer_type(tl.bfloat16)), 16)
@@ -884,7 +735,6 @@ def dispatch_frontend_dual_pull(
     recv_tab,
     rsum_tab,
     sig_tab,
-    sm_expert_count,
     expert_send_count,
     gctr,
     meta_ready,
@@ -900,28 +750,21 @@ def dispatch_frontend_dual_pull(
     ITERS: tl.constexpr,
     NEXP_POW2: tl.constexpr,
     USE_D8_TMA1D: tl.constexpr,
-    USE_SMEM_EXPERT_COUNT: tl.constexpr,
-    FAST_NVLINK_BARRIER: tl.constexpr,
 ):
     """Two-warp D1-D5 frontend; publish finalized receive metadata."""
     sm_idx = tl.program_id(0)
     routes = NTOK * TOPK
     offs_e = tl.arange(0, NEXP_POW2)
     e_ok = offs_e < NEXP
-    ec_row = sm_expert_count + sm_idx * NEXP
-
-    if USE_SMEM_EXPERT_COUNT:
-        ec_s = tle.gpu.alloc(
-            [NEXP_POW2],
-            dtype=tl.int32,
-            layout=None,
-            scope=tle.gpu.smem,
-            nv_mma_shared_layout=False,
-        )
-        ec_vec = tle.gpu.local_ptr(ec_s, (offs_e,))
-        tl.store(ec_vec, tl.zeros((NEXP_POW2,), dtype=tl.int32))
-    else:
-        tl.store(ec_row + offs_e, tl.zeros((NEXP_POW2,), dtype=tl.int32), mask=e_ok)
+    ec_s = tle.gpu.alloc(
+        [NEXP_POW2],
+        dtype=tl.int32,
+        layout=None,
+        scope=tle.gpu.smem,
+        nv_mma_shared_layout=False,
+    )
+    ec_vec = tle.gpu.local_ptr(ec_s, (offs_e,))
+    tl.store(ec_vec, tl.zeros((NEXP_POW2,), dtype=tl.int32))
     dispatch_sync(USE_D8_TMA1D)
 
     for it in tl.static_range(0, ITERS):
@@ -929,34 +772,23 @@ def dispatch_frontend_dual_pull(
         m = r < routes
         e = tl.load(topk_local + r, mask=m, other=-1).to(tl.int32)
         valid = m & (e >= 0)
-        if USE_SMEM_EXPERT_COUNT:
-            tl.atomic_add(
-                tle.gpu.local_ptr(ec_s, (tl.where(valid, e, 0),)),
-                1,
-                mask=valid,
-                sem="relaxed",
-                scope="cta",
-            )
-        else:
-            tl.atomic_add(ec_row + e, 1, mask=valid, sem="relaxed")
+        tl.atomic_add(
+            tle.gpu.local_ptr(ec_s, (tl.where(valid, e, 0),)),
+            1,
+            mask=valid,
+            sem="relaxed",
+            scope="cta",
+        )
     dispatch_sync(USE_D8_TMA1D)
 
-    # ec_vec 从smem中读取expert count数组
-    if USE_SMEM_EXPERT_COUNT:
-        cnt = tl.load(ec_vec)
-    else:
-        cnt = tl.load(ec_row + offs_e, mask=e_ok, other=0)
-    # 一个int64保存count和发送状态，high 32bit保存完成统计的CTA数量，low 32bit保存route数量
+    cnt = tl.load(ec_vec)
+    # Pack one completed CTA in the high word and its route count in the low word.
     send_value = (tl.full((NEXP_POW2,), 1, tl.int64) << 32) | cnt.to(tl.int64)
-    # 把send_value统计到expert_send_count中，类似于workspace.get_expert_send_count。这里也得到了当前CTA要把route写在expert_send_count的起始位置
+    # The previous count reserves this CTA's range in each expert queue.
     old = tl.atomic_add(
         expert_send_count + offs_e, send_value, mask=e_ok, sem="relaxed"
     )
-    # 最后保存回到ec_vec中
-    if USE_SMEM_EXPERT_COUNT:
-        tl.store(ec_vec, (old & 0xFFFFFFFF).to(tl.int32))
-    else:
-        tl.store(ec_row + offs_e, (old & 0xFFFFFFFF).to(tl.int32), mask=e_ok)
+    tl.store(ec_vec, (old & 0xFFFFFFFF).to(tl.int32))
     dispatch_sync(USE_D8_TMA1D)
 
     for it in tl.static_range(0, ITERS):
@@ -966,17 +798,14 @@ def dispatch_frontend_dual_pull(
         valid = m & (e >= 0)
         owner = tl.where(valid, e // EPR, 0)
         local_e = tl.where(valid, e % EPR, 0)
-        # d3_slot 对应 dst_slot_idx，通过atomic找到expert_count buffer中当前route对应的位置
-        if USE_SMEM_EXPERT_COUNT:
-            d3_slot = tl.atomic_add(
-                tle.gpu.local_ptr(ec_s, (tl.where(valid, e, 0),)),
-                1,
-                mask=valid,
-                sem="relaxed",
-                scope="cta",
-            )
-        else:
-            d3_slot = tl.atomic_add(ec_row + e, 1, mask=valid, sem="relaxed")
+        # Allocate the route's slot within the reserved expert range.
+        d3_slot = tl.atomic_add(
+            tle.gpu.local_ptr(ec_s, (tl.where(valid, e, 0),)),
+            1,
+            mask=valid,
+            sem="relaxed",
+            scope="cta",
+        )
         qb = peer_i32(q_tab, owner)
         tl.store(qb + (local_e * NPES + MY_PE) * MAX_RECV + d3_slot, r, mask=valid)
     dispatch_sync(USE_D8_TMA1D)
@@ -984,18 +813,15 @@ def dispatch_frontend_dual_pull(
     dispatch_rank_barrier(gctr + 0, NUM_SMS, USE_D8_TMA1D)
 
     if sm_idx == 0:
-        # 目标rank
         d4_owner = tl.where(e_ok, offs_e // EPR, 0)
         d4_le = tl.where(e_ok, offs_e % EPR, 0)
-        # 高32bit是完成统计的CTA数量，低32位是发送route总数
         status = tl.load(expert_send_count + offs_e, mask=e_ok, other=0)
-        # recv_tab[owner][MY_PE][local_expert] = route数，保存每个source rank分别发来多少route
+        # Publish per-source counts and aggregate them at each destination rank.
         tl.store(
             peer_i64(recv_tab, d4_owner) + (MY_PE * EPR + d4_le),
             status & 0xFFFFFFFF,
             mask=e_ok,
         )
-        # rsum_tab[local_expert] 每个 expert 从所有 rank 接收的route总数
         tl.atomic_add(
             peer_i64(rsum_tab, d4_owner) + d4_le,
             status,
@@ -1013,7 +839,6 @@ def dispatch_frontend_dual_pull(
         NPES,
         NUM_SMS,
         USE_D8_TMA1D,
-        FAST_NVLINK_BARRIER,
     )
     tl.atomic_add(meta_ready + sm_idx, 1, sem="release")
 
@@ -1120,7 +945,6 @@ def dispatch_role_dual_pull(
     rsum_tab,
     sig_tab,
     meta_tab,
-    sm_expert_count,
     expert_send_count,
     l1_arrival_count,
     gctr,
@@ -1156,8 +980,6 @@ def dispatch_role_dual_pull(
     ITERS: tl.constexpr,
     NEXP_POW2: tl.constexpr,
     USE_D8_TMA1D: tl.constexpr,
-    USE_SMEM_EXPERT_COUNT: tl.constexpr,
-    FAST_NVLINK_BARRIER: tl.constexpr,
 ):
     # D1-D5: both warps cooperate under the same role-scoped barriers.
     dispatch_frontend_dual_pull(
@@ -1166,7 +988,6 @@ def dispatch_role_dual_pull(
         recv_tab,
         rsum_tab,
         sig_tab,
-        sm_expert_count,
         expert_send_count,
         gctr,
         meta_ready,
@@ -1182,8 +1003,6 @@ def dispatch_role_dual_pull(
         ITERS,
         NEXP_POW2,
         USE_D8_TMA1D,
-        USE_SMEM_EXPERT_COUNT,
-        FAST_NVLINK_BARRIER,
     )
 
     # D6-D9: keep the raw ABI tail in a separate helper.  This wrapper then
@@ -1227,7 +1046,6 @@ def dispatch_role_dual_pull(
 @triton.jit
 def ws_megakernel(
     topk_local,
-    tok_tab,
     sf_tab,
     w_tab,
     q_tab,
@@ -1237,7 +1055,6 @@ def ws_megakernel(
     meta_tab,
     cb_tab,
     cb_local,
-    sm_expert_count,
     expert_send_count,
     l1_arrival_count,
     l2_arrival_mask,
@@ -1265,12 +1082,7 @@ def ws_megakernel(
     tp5,
     tp6,
     tp7,
-    l1_st_desc,
     USE_D8_TMA1D: tl.constexpr,
-    USE_L1_STORE_PIPE: tl.constexpr,
-    USE_SMEM_EXPERT_COUNT: tl.constexpr,
-    FAST_NVLINK_BARRIER: tl.constexpr,
-    D8_PULL_STREAMS: tl.constexpr,
     MY_PE: tl.constexpr,
     NPES: tl.constexpr,
     NUM_SMS: tl.constexpr,
@@ -1279,7 +1091,6 @@ def ws_megakernel(
     NEXP: tl.constexpr,
     EPR: tl.constexpr,
     EPR_POW2: tl.constexpr,
-    R_POW2: tl.constexpr,
     EPW: tl.constexpr,
     MAX_RECV: tl.constexpr,
     BLOCK_M: tl.constexpr,
@@ -1299,22 +1110,12 @@ def ws_megakernel(
     POOL_TOKENS: tl.constexpr,
     NEXP_POW2: tl.constexpr,
     K_POW2: tl.constexpr,
-    NSF_POW2: tl.constexpr,
     BLOCK_R: tl.constexpr,
     ITERS: tl.constexpr,
     STAGES: tl.constexpr,
-    DISPATCH_WARPS: tl.constexpr,
-    MATH_WARPS: tl.constexpr,
 ):
-    # Reject direct launches that try to mutate this immutable snapshot.
-    tl.static_assert(USE_L1_STORE_PIPE == 0, "snapshot fixes USE_L1_STORE_PIPE=False")
-    tl.static_assert(USE_D8_TMA1D == 2, "snapshot fixes full raw D8 TMA1D")
-    tl.static_assert(USE_SMEM_EXPERT_COUNT, "snapshot fixes SMEM expert counts")
-    tl.static_assert(FAST_NVLINK_BARRIER, "snapshot fixes fast NVLink barrier")
-    tl.static_assert(D8_PULL_STREAMS == 2, "snapshot fixes two D8 pull streams")
-    tl.static_assert(BLOCK_R == 256, "snapshot fixes BLOCK_R=256")
-    tl.static_assert(DISPATCH_WARPS == 2, "snapshot fixes dispatch role warps")
-    tl.static_assert(MATH_WARPS == 4, "snapshot fixes math warps")
+    tl.static_assert(USE_D8_TMA1D == 2, "raw D8 dispatch requires TMA1D mode")
+    tl.static_assert(BLOCK_R == 256, "D8 dispatch requires BLOCK_R=256")
 
     a_s = tle.gpu.alloc(
         [STAGES, BLOCK_M, BLOCK_K], dtype=tl.float8e4nv, layout=None, scope=tle.gpu.smem
@@ -1339,13 +1140,6 @@ def ws_megakernel(
         scope=tle.gpu.smem,
         nv_mma_shared_layout=False,
     )
-    l1o_s = tle.gpu.alloc(
-        [2, BLOCK_M // 2, L1_OUT_N],
-        dtype=tl.float8e4nv,
-        layout=None,
-        scope=tle.gpu.smem,
-    )
-
     d8_token0_s = tle.gpu.alloc(
         [K],
         dtype=tl.float8e4nv,
@@ -1393,8 +1187,6 @@ def ws_megakernel(
                     p.reader(name="m0"),
                     cd_s,
                     dst_rows_s,
-                    l1o_s,
-                    l1_st_desc,
                     meta_ready,
                     rsum_tab,
                     cb_tab,
@@ -1411,7 +1203,6 @@ def ws_megakernel(
                     w1_sf,
                     w2_sf,
                     0,
-                    USE_L1_STORE_PIPE,
                     MY_PE,
                     NPES,
                     NUM_SMS,
@@ -1422,8 +1213,6 @@ def ws_megakernel(
                     BLOCK_N,
                     BLOCK_K,
                     INTER,
-                    L1_N,
-                    L2_N,
                     NK1,
                     NK2,
                     NL1N,
@@ -1435,8 +1224,6 @@ def ws_megakernel(
                     TOPK,
                     K,
                     K_POW2,
-                    False,
-                    False,
                 ),
             ),
             (
@@ -1445,8 +1232,6 @@ def ws_megakernel(
                     p.reader(name="m1"),
                     cd_s,
                     dst_rows_s,
-                    l1o_s,
-                    l1_st_desc,
                     meta_ready,
                     rsum_tab,
                     cb_tab,
@@ -1463,7 +1248,6 @@ def ws_megakernel(
                     w1_sf,
                     w2_sf,
                     1,
-                    USE_L1_STORE_PIPE,
                     MY_PE,
                     NPES,
                     NUM_SMS,
@@ -1474,8 +1258,6 @@ def ws_megakernel(
                     BLOCK_N,
                     BLOCK_K,
                     INTER,
-                    L1_N,
-                    L2_N,
                     NK1,
                     NK2,
                     NL1N,
@@ -1487,8 +1269,6 @@ def ws_megakernel(
                     TOPK,
                     K,
                     K_POW2,
-                    False,
-                    False,
                 ),
             ),
             (
@@ -1502,7 +1282,6 @@ def ws_megakernel(
                     rsum_tab,
                     sig_tab,
                     meta_tab,
-                    sm_expert_count,
                     expert_send_count,
                     l1_arrival_count,
                     gctr,
@@ -1538,8 +1317,6 @@ def ws_megakernel(
                     ITERS,
                     NEXP_POW2,
                     USE_D8_TMA1D,
-                    USE_SMEM_EXPERT_COUNT,
-                    FAST_NVLINK_BARRIER,
                 ),
             ),
             (
@@ -1559,7 +1336,6 @@ def ws_megakernel(
                     MY_PE,
                     NUM_SMS,
                     EPR,
-                    EPR_POW2,
                     EPW,
                     BLOCK_M,
                     BLOCK_N,
@@ -1590,7 +1366,6 @@ def ws_megakernel(
                     MY_PE,
                     NUM_SMS,
                     EPR,
-                    EPR_POW2,
                     EPW,
                     BLOCK_M,
                     BLOCK_N,
@@ -1605,7 +1380,7 @@ def ws_megakernel(
                 ),
             ),
         ],
-        [MATH_WARPS, 2, 1, 1],
+        [4, 2, 1, 1],
         [224, 48, 48, 48],
     )
 
@@ -1763,12 +1538,6 @@ def launch_megamoe_fp8(
         strides=[intermediate, 1],
         block_shape=[block_m, block_k],
     )
-    l1_store_desc = TensorDescriptor(
-        context.l2_activations,
-        shape=[pool_tokens, intermediate],
-        strides=[intermediate, 1],
-        block_shape=[block_m // 2, block_n // 2],
-    )
     b2_desc = TensorDescriptor(
         w2.view(experts_per_rank * l2_n, intermediate),
         shape=[experts_per_rank * l2_n, intermediate],
@@ -1793,7 +1562,6 @@ def launch_megamoe_fp8(
     _fill_tensor_bytes(context.l2_arrival_mask, 0)
     _fill_tensor_bytes(context.global_counters, 0)
     _fill_tensor_bytes(context.metadata_ready, 0)
-    _fill_tensor_bytes(context.sm_expert_count, -1)
     _zero_symmetric(
         context.recv_count_ptrs,
         context.rank,
@@ -1810,15 +1578,12 @@ def launch_megamoe_fp8(
 
     routes = ntok * topk
     iters = triton.cdiv(routes, context.num_sms * block_r)
-    r_pow2 = 1 << (ranks - 1).bit_length()
     epr_pow2 = 1 << (experts_per_rank - 1).bit_length()
     nexp_pow2 = 1 << (context.num_experts - 1).bit_length()
     hidden_pow2 = 1 << (hidden - 1).bit_length()
-    nsf_pow2 = 1 << (num_sf - 1).bit_length()
 
     ws_megakernel[(context.num_sms,)](
         topk_ids,
-        context.token_ptrs,
         context.scale_ptrs,
         context.route_weight_ptrs,
         context.queue_ptrs,
@@ -1828,7 +1593,6 @@ def launch_megamoe_fp8(
         context.metadata_ptrs,
         context.combine_ptrs,
         context.combine_local,
-        context.sm_expert_count,
         context.expert_send_count,
         context.l1_arrival_count,
         context.l2_arrival_mask,
@@ -1849,12 +1613,7 @@ def launch_megamoe_fp8(
         sfa1_desc,
         sfa2_desc,
         *peer_tokens,
-        l1_store_desc,
         USE_D8_TMA1D=2,
-        USE_L1_STORE_PIPE=False,
-        USE_SMEM_EXPERT_COUNT=True,
-        FAST_NVLINK_BARRIER=True,
-        D8_PULL_STREAMS=2,
         MY_PE=context.rank,
         NPES=ranks,
         NUM_SMS=context.num_sms,
@@ -1863,7 +1622,6 @@ def launch_megamoe_fp8(
         NEXP=context.num_experts,
         EPR=experts_per_rank,
         EPR_POW2=epr_pow2,
-        R_POW2=r_pow2,
         EPW=min(8, experts_per_rank),
         MAX_RECV=context.max_recv,
         BLOCK_M=block_m,
@@ -1883,12 +1641,9 @@ def launch_megamoe_fp8(
         POOL_TOKENS=pool_tokens,
         NEXP_POW2=nexp_pow2,
         K_POW2=hidden_pow2,
-        NSF_POW2=nsf_pow2,
         BLOCK_R=block_r,
         ITERS=iters,
         STAGES=stages,
-        DISPATCH_WARPS=2,
-        MATH_WARPS=4,
         num_warps=LOADER_WARPS,
     )
 

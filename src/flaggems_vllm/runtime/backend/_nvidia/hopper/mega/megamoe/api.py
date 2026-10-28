@@ -60,7 +60,6 @@ class MegaMoEContext:
     minimum element counts, where ``N=num_sms``, ``X=num_experts``, and
     ``I=intermediate_size``::
 
-        sm_expert_count    int32   N * X
         expert_send_count  int64   X
         l1_arrival_count   int32   L / 128
         l2_arrival_mask    int64   L / 128
@@ -103,7 +102,6 @@ class MegaMoEContext:
     combine_local: int
     token_peer_ptrs: Tuple[int, ...]
 
-    sm_expert_count: torch.Tensor
     expert_send_count: torch.Tensor
     l1_arrival_count: torch.Tensor
     l2_arrival_mask: torch.Tensor
